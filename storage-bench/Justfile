@@ -1,0 +1,111 @@
+# storage-bench container image
+#
+#   just                       build the image and load it into the engine
+#   just smoke                 prove the image works against a throwaway tmpfs
+#   just run /mnt/ceph /mnt/px benchmark those host paths
+#
+# Script tunables are read from the environment and forwarded into the
+# container, so `FIO_RUNTIME=60 ORDER=by-test just run /mnt/ceph` works.
+
+image := "storage-bench"
+tag := "2026-08-20-r1"
+
+# docker or podman; override with CONTAINER_ENGINE=podman
+engine := env("CONTAINER_ENGINE", "docker")
+
+# Extra flags for `run`/`smoke`, e.g. RUN_ARGS="--cpus 4 --network none"
+run_args := env("RUN_ARGS", "")
+
+# Where `just run` drops its reports on the host.
+results := justfile_directory() / "bench-results"
+
+_default: help
+
+# List the available recipes.
+help:
+    @just --list
+
+# Build the image tarball with Nix (-> ./result).
+build:
+    nix-build --argstr name {{ image }} --argstr tag {{ tag }}
+
+# Build, then load the image into the local container engine.
+load: build
+    {{ engine }} load < result
+
+# Each host path is bind-mounted at /data/<basename> and handed to the script in
+# that order, so `just run /mnt/ceph /mnt/portworx` benchmarks both.
+
+# Run the benchmark suite against one or more host paths.
+run +hostpaths: load
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{ results }}
+    vols=() targets=() envs=()
+    for p in {{ hostpaths }}; do
+        [ -d "$p" ] || { echo "not a directory: $p" >&2; exit 1; }
+        name="$(basename "$p")"
+        vols+=(-v "$(realpath "$p"):/data/$name")
+        targets+=("/data/$name")
+    done
+    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE; do
+        if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
+    done
+    # As the calling user, both because the script is meant to run unprivileged
+    # and so the reports are not left root-owned. HOME must move off /root,
+    # which that user cannot write.
+    {{ engine }} run --rm \
+        --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        -v {{ results }}:/out -e OUTDIR=/out \
+        "${vols[@]}" "${envs[@]}" {{ run_args }} \
+        {{ image }}:{{ tag }} "${targets[@]}"
+    echo "Reports in {{ results }}"
+
+# Interactive shell in the image.
+shell: load
+    {{ engine }} run --rm -it --entrypoint bash {{ image }}:{{ tag }}
+
+# Measures nothing useful — it exercises dd, fio, the awk/sed parsing and the
+# report generator against a container-local tmpfs.
+
+# Tiny end-to-end run to prove the image works.
+smoke: load
+    mkdir -p {{ results }}/smoke
+    {{ engine }} run --rm \
+        --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
+        -v {{ results }}/smoke:/out -e OUTDIR=/out \
+        -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
+        -e FIO_SIZE=64M -e FIO_RUNTIME=2 {{ run_args }} \
+        {{ image }}:{{ tag }} /data/a /data/b
+    @ls -l {{ results }}/smoke
+
+# Uncompressed size of the loaded image, and of the tarball.
+size: build
+    @{{ engine }} image ls {{ image }}:{{ tag }}
+    @echo "tarball: $(du -h --dereference result | cut -f1)"
+
+# Both `{{ tag }}` and `latest` are pushed, and both are tagged off the single
+# image that `load` just built, so `latest` cannot end up on an older digest
+# than the versioned tag:
+#
+#   just push quay.io/athaller                 # -> :{{ tag }} and :latest
+#   just tag=v2 push quay.io/athaller          # -> :v2 and :latest
+#
+# Setting tag=latest collapses the two into one push rather than pushing twice.
+
+# Push to a registry, e.g. `just push quay.io/athaller`.
+push registry: load
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tags=({{ tag }})
+    [ "{{ tag }}" = latest ] || tags+=(latest)
+    for t in "${tags[@]}"; do
+        {{ engine }} tag {{ image }}:{{ tag }} {{ registry }}/{{ image }}:"$t"
+        {{ engine }} push {{ registry }}/{{ image }}:"$t"
+    done
+
+# Drop the nix-build symlink (it is also a GC root) and the local image.
+clean:
+    rm -f result
+    -{{ engine }} image rm {{ image }}:{{ tag }}
