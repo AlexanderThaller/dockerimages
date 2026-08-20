@@ -26,7 +26,11 @@
 # writes still precede the reads that depend on them.
 #
 # Tunables (env vars):
-#   OUTDIR        where reports land            (default ./bench-results-<timestamp>)
+#   OUTBASE       directory the run dir goes in (default /tmp)
+#   RUNDIR        this run's directory inside it
+#                                               (default bench-results-<timestamp>;
+#                                                set it empty to write straight
+#                                                into OUTBASE)
 #   ORDER         by-mount | by-test            (default by-mount)
 #   SETTLE        seconds to idle between runs  (default 15)
 #   DD_ZERO_MB    size of the dd zero write     (default 1024)
@@ -47,7 +51,18 @@ MOUNTS=("$@")
 [ ${#MOUNTS[@]} -eq 0 ] && echo "Usage: $0 <mount1> [<mount2> ...]" >&2 && exit 1
 
 TS="$(date +%Y%m%d-%H%M%S)"
-OUTDIR="${OUTDIR:-/tmp/bench-results-$TS}"
+# Where the results go, in two parts, so that pointing the benchmark at a
+# mounted volume does not also flatten every run into the same directory. The
+# volume is OUTBASE and stays put; RUNDIR is per-run and carries the timestamp,
+# so consecutive runs sit side by side instead of overwriting each other.
+#
+# OUTDIR is still read, as the base, because that is the variable callers were
+# passing the volume in before this was split — an old `OUTDIR=/out` now means
+# `/out/bench-results-<timestamp>` rather than being silently ignored. Setting
+# RUNDIR empty restores the flat behaviour.
+OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
+RUNDIR="${RUNDIR-bench-results-$TS}"
+OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
 SETTLE="${SETTLE:-15}"
 DD_ZERO_MB="${DD_ZERO_MB:-10240}"

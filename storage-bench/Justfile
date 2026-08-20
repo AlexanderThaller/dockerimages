@@ -52,25 +52,33 @@ run +hostpaths: load
         vols+=(-v "$(realpath "$p"):/data/$name")
         targets+=("/data/$name")
     done
-    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE; do
+    # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
+    # `RUNDIR=before-upgrade just run /mnt/ceph`.
+    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged
     # and so the reports are not left root-owned. HOME must move off /root,
     # which that user cannot write.
+    #
+    # OUTBASE, not OUTDIR: the mount is the base, and the script puts each run
+    # in its own directory underneath it, so a second run does not overwrite
+    # the first.
     {{ engine }} run --rm \
         --user "$(id -u):$(id -g)" -e HOME=/tmp \
-        -v {{ results }}:/out -e OUTDIR=/out \
+        -v {{ results }}:/out -e OUTBASE=/out \
         "${vols[@]}" "${envs[@]}" {{ run_args }} \
         {{ image }}:{{ tag }} "${targets[@]}"
-    echo "Reports in {{ results }}"
+    echo "Reports in {{ results }}/ (one directory per run)"
 
 # Interactive shell in the image.
 shell: load
     {{ engine }} run --rm -it --entrypoint bash {{ image }}:{{ tag }}
 
 # Measures nothing useful — it exercises dd, fio, the awk/sed parsing and the
-# report generator against a container-local tmpfs.
+# report generator against a container-local tmpfs. Empty RUNDIR because a
+# throwaway check wants its output in one predictable place, not in a new
+# timestamped directory on every invocation.
 
 # Tiny end-to-end run to prove the image works.
 smoke: load
@@ -78,7 +86,7 @@ smoke: load
     {{ engine }} run --rm \
         --user "$(id -u):$(id -g)" -e HOME=/tmp \
         --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
-        -v {{ results }}/smoke:/out -e OUTDIR=/out \
+        -v {{ results }}/smoke:/out -e OUTBASE=/out -e RUNDIR= \
         -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
         -e FIO_SIZE=64M -e FIO_RUNTIME=2 {{ run_args }} \
         {{ image }}:{{ tag }} /data/a /data/b
@@ -89,17 +97,18 @@ size: build
     @{{ engine }} image ls {{ image }}:{{ tag }}
     @echo "tarball: $(du -h --dereference result | cut -f1)"
 
-# Both `{{ tag }}` and `latest` are pushed, and both are tagged off the single
-# image that `load` just built, so `latest` cannot end up on an older digest
-# than the versioned tag:
+# Both the build's own tag and `latest` are pushed, and both are tagged off the
+# single image that `load` just built, so `latest` cannot end up on an older
+# digest than the versioned tag:
 #
-#   just push quay.io/athaller                 # -> :{{ tag }} and :latest
-#   just tag=v2 push quay.io/athaller          # -> :v2 and :latest
+#   just push                          # -> default_registry, :<tag> and :latest
+#   just tag=v2 push                   # -> :v2 and :latest
+#   just push quay.io/someone          # -> somewhere else, same two tags
 #
 # Setting tag=latest collapses the two into one push rather than pushing twice.
 
-# Push to a registry, e.g. `just push quay.io/athaller`.
-push registry: load
+# Push to a registry (default: docker.io/athallerde).
+push registry=default_registry: load
     #!/usr/bin/env bash
     set -euo pipefail
     tags=({{ tag }})
