@@ -67,6 +67,44 @@ let
     postInstall = "";
   });
 
+  # CRuby ships a pile of gems inside the interpreter, and an image scanner
+  # reports a CVE against every one of them whether or not anything can reach
+  # it. Deleting the ones nothing here uses is a fix rather than a suppression:
+  # the vulnerable code is not in the image, so it stays fixed even if some
+  # future code path tries to require it. The price is a Ruby build from source
+  # — a store path cannot be edited after the fact.
+  #
+  # Two kinds, removed differently. "Bundled" gems are ordinary gems that live
+  # under gems/; these four are mail and file-transfer clients that a container
+  # converting AsciiDoc to HTML has no business carrying, and net-imap is what
+  # prompted this (CVE-2026-42257, IMAP command injection via CRLF, CVSS 9.8).
+  # net-http and net-protocol stay: open-uri needs them, and open-uri is how
+  # asciidoctor resolves an `include::` or an image over http.
+  #
+  # "Default" gems like erb live in the stdlib tree with a stub gemspec, so they
+  # take a different set of paths. erb (CVE-2026-41316) is reachable from
+  # asciidoctor only through its custom-template converter, which needs -T on
+  # the command line; the script never passes it. Dropping erb is what makes
+  # `asciidoctor -T` unavailable in this image — put it back by deleting the
+  # erb lines below.
+  ruby = pkgs.ruby.overrideAttrs (old: {
+    postInstall = (old.postInstall or "") + ''
+      gemDir=$out/${old.passthru.gemPath}
+
+      for gem in net-imap net-pop net-smtp net-ftp; do
+        rm -rf "$gemDir"/gems/"$gem"-*
+        rm -f "$gemDir"/specifications/"$gem"-*.gemspec
+        rm -f "$gemDir"/cache/"$gem"-*.gem
+      done
+
+      # The globs cover the version and architecture directories, e.g.
+      # lib/ruby/3.4.0 and lib/ruby/3.4.0/x86_64-linux, without naming either.
+      rm -f "$gemDir"/specifications/default/erb-*.gemspec
+      rm -rf $out/lib/ruby/*/erb.rb $out/lib/ruby/*/erb $out/lib/ruby/*/*/erb
+      rm -f $out/bin/erb
+    '';
+  });
+
   # nixpkgs' asciidoctor is a bundle: asciidoctor-pdf, prawn, a PDF reader, and
   # three syntax highlighters, one of which (pygments.rb) shells out to CPython
   # and so pins the same ~130 MB interpreter fio did. The report is rendered to
@@ -84,6 +122,9 @@ let
   asciidoctor = pkgs.bundlerApp {
     pname = "asciidoctor";
     exes = [ "asciidoctor" ];
+    # The trimmed interpreter above, not pkgs.ruby. bundlerEnv rebuilds bundler
+    # against whatever it is given, so the image ends up with one Ruby, not two.
+    inherit ruby;
 
     gemfile = pkgs.writeText "Gemfile" ''
       source 'https://rubygems.org'
