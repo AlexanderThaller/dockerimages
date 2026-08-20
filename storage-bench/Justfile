@@ -8,7 +8,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just run /mnt/ceph` works.
 
 image := "storage-bench"
-tag := "2026-08-20-r3"
+tag := "2026-08-20-r4"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.

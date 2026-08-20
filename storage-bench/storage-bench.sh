@@ -134,6 +134,9 @@ TESTS=(
   fsync_8k_qd1
 )
 
+# Filled in by run_fio, read by the report: test name -> the flags it was given.
+declare -A FIO_ARGS=()
+
 CREATED=()
 cleanup() {
   echo
@@ -286,6 +289,12 @@ run_fio() {
   sl="$(slug "$mp")"
   local raw="$RAWDIR/fio_${sl}_${name}.terse"
   local out rc line row
+
+  # Recorded so the report's per-test section can quote what actually ran
+  # instead of a hand-copied duplicate that drifts the first time a flag here
+  # changes. Every mount runs a test with the same flags — only --directory
+  # differs, and that is added below — so the last writer winning is fine.
+  FIO_ARGS["$name"]="$*"
 
   info "fio $name ..."
   out="$(fio --output-format=terse --terse-version=3 \
@@ -454,6 +463,68 @@ for t in "${TESTS[@]}"; do
   esac
 done
 
+# What each fio job is for, in the report's words. Kept next to nothing else on
+# purpose: the flags themselves are quoted from FIO_ARGS, which run_fio fills in
+# as it runs, so this only has to explain intent and never has to be kept in
+# step with the command line.
+fio_test_purpose() { # <test>
+  case "$1" in
+  seq_write_1m)
+    cat <<'EOF'
+Streaming write bandwidth. One worker pushing 1 MiB blocks with 16 requests in
+flight — large enough blocks and deep enough queue that the backend has every
+chance to coalesce and pipeline, so this is close to the best sequential number
+it can produce. This is the figure that predicts bulk restores, backup writes,
+image pulls and log shipping.
+EOF
+    ;;
+  seq_read_1m)
+    cat <<'EOF'
+Streaming read bandwidth, reading back the file `seq_write_1m` just wrote. Same
+shape as the write test, so the two are directly comparable; a backend that
+reads much faster than it writes is usually acknowledging writes to a slower
+durable tier, or replicating them.
+EOF
+    ;;
+  rand_write_4k)
+    cat <<'EOF'
+Write IOPS under concurrency. Four workers share one file, each with 32 requests
+outstanding, so up to 128 4 KiB writes are in flight at once. Blocks this small
+and scattered defeat readahead and write coalescing, which is the point: it
+measures how many discrete operations the backend can retire per second rather
+than how much data it can stream.
+EOF
+    ;;
+  rand_read_4k)
+    cat <<'EOF'
+Read IOPS under the same concurrency, against the file `rand_write_4k` left
+behind. With the page cache bypassed every one of these has to be served by the
+backend, so this is the read-side counterpart to the number above.
+EOF
+    ;;
+  rand_rw_70_30_4k)
+    cat <<'EOF'
+The same random 4 KiB workload with reads and writes interleaved, 70% read to
+30% write, which is far closer to what an application actually does than either
+pure test. It is also where backends that look fine in isolation come apart:
+read-modify-write on parity layouts, and log-structured stores whose compaction
+only kicks in once writes are mixed in, both show up here and not above.
+EOF
+    ;;
+  fsync_8k_qd1)
+    cat <<'EOF'
+Commit latency, and the number that usually separates one storage class from
+another. A single worker, one request outstanding, `fsync` after every 8 KiB
+write: no concurrency, so nothing can hide the round trip and every write must
+be durable before the next one starts. This is what a database WAL does, and
+the IOPS figure here is roughly the transaction rate a synchronous commit can
+expect. It deliberately uses the blocking `psync` engine and a fixed 1G file
+rather than the shared `FIO_SIZE`, because queue depth 1 is the whole point.
+EOF
+    ;;
+  esac
+}
+
 # Reduce one fio log to "seconds value" pairs for a single data direction.
 # Concurrent jobs each emit their own sample per window (per_job_logs=0 only
 # concatenates them), so throughput has to be summed across jobs while latency
@@ -617,10 +688,10 @@ log "Writing report"
 
 * Run order was \`${ORDER}\`. In \`by-mount\` each mount gets an uninterrupted block of tests; in \`by-test\` the mounts are paired closely in time so shared backend load hits both about equally. If the two paths share physical hardware, \`by-test\` is the fairer head-to-head.
 * A ${SETTLE}s idle period separates consecutive runs so the backend can finish flushing before the next measurement starts.
-* All fio jobs use \`--direct=1\` so results reflect the storage backend rather than the page cache.
+* What each fio job measures, and the exact command it ran, is in <<fio-tests,fio tests>> — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
 * The \`dd_write_urandom\` figure is *CPU-bound in most environments* — \`/dev/urandom\` generation, not the disk, is usually the limiting factor. Treat it as a check on how the backend handles incompressible data (relevant if it does inline compression or dedup), not as a throughput measurement.
 * \`dd_read_direct\` bypasses the page cache. If it appears as \`dd_read_cached\` instead, the filesystem rejected O_DIRECT and that number is inflated by RAM caching.
-* \`fsync_8k_qd1\` is queue-depth 1 with an fsync per write. This is the closest proxy for database commit latency and is usually the number that separates storage classes in practice.
+* If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\`.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
 * The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. That is what the <<over-time,time series>> section is for.
 
@@ -652,6 +723,51 @@ before dd reports its timing. Rows appear in execution order.
 include::dd_results.csv[]
 |===
 
+ADOCEOF
+
+  # ---- what each fio job actually ran ------------------------------------
+  cat <<EOF
+[#fio-tests]
+== fio tests
+
+${#FIO_TESTS[@]} jobs, each isolating one thing the storage can be bad at. Every
+one of them is also given these flags, which are what make the numbers
+comparable:
+
+\`--direct=1\`:: O_DIRECT, so reads and writes go to the backend instead of
+being served by the page cache. Without it most of these tests would be
+measuring RAM.
+\`--time_based --runtime=${FIO_RUNTIME}\`:: each job runs for a fixed ${FIO_RUNTIME} seconds,
+looping over its file if it finishes early. Every mount therefore gets equal
+*time* rather than equal *bytes*, so a slow backend cannot shorten its own run.
+\`--ioengine=${IOENGINE}\`:: how I/O is submitted to the kernel; an asynchronous
+engine such as the default \`libaio\` is what lets a queue depth above 1 mean
+anything. The commit-latency test overrides it with \`psync\`, which blocks on
+each write, because blocking is the thing it is measuring.
+\`--group_reporting\`:: with more than one worker, report the aggregate rather
+than each worker separately.
+\`--directory\`:: the mount under test. It is the only flag that differs between
+mounts — everything below is identical for all of them.
+
+The command shown under each test is the one that ran, recorded as it ran.
+
+EOF
+
+  for t in "${FIO_TESTS[@]}"; do
+    echo "=== $t"
+    echo
+    fio_test_purpose "$t"
+    echo
+    if [ -n "${FIO_ARGS[$t]:-}" ]; then
+      echo "[source,console]"
+      echo "----"
+      echo "\$ fio --directory=<mount> ${FIO_ARGS[$t]}"
+      echo "----"
+      echo
+    fi
+  done
+
+  cat <<'ADOCEOF'
 == fio results
 
 Rows appear in execution order.
