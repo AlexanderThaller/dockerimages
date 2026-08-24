@@ -1,5 +1,5 @@
 # storage-bench — a container image that runs ./storage-bench.sh, with fio,
-# gnuplot, asciidoctor and bash.
+# gnuplot, cmark-gfm and bash.
 #
 #   nix-build                       # -> ./result, a docker image tarball
 #   docker load < result            # or: podman load < result
@@ -82,7 +82,7 @@ pkgs.dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.title" = "storage-bench";
       "org.opencontainers.image.description" =
-        "dd/fio storage benchmark suite with gnuplot and asciidoctor reporting";
+        "dd/fio storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
     };
   };
 }

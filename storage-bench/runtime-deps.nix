@@ -5,11 +5,11 @@
 # still completes the benchmark, it just silently produces a report with no
 # graphs in it — the kind of difference you notice an hour after the run.
 #
-# Most of what is here is a trimmed variant rather than the stock package.
-# Stock fio, gnuplot and asciidoctor carry optional features this benchmark
-# never touches, and between them they were three quarters of the image. Each
-# override below says what it drops and what would notice; `just size` is what
-# tells you whether it is still true after a nixpkgs bump.
+# fio and gnuplot are trimmed variants rather than the stock packages. Stock,
+# both carry optional features this benchmark never touches, and between them
+# they were most of the image. Each override below says what it drops and what
+# would notice; `just size` is what tells you whether it is still true after a
+# nixpkgs bump.
 
 pkgs:
 
@@ -67,115 +67,45 @@ let
     postInstall = "";
   });
 
-  # CRuby ships a pile of gems inside the interpreter, and an image scanner
-  # reports a CVE against every one of them whether or not anything can reach
-  # it. Deleting the ones nothing here uses is a fix rather than a suppression:
-  # the vulnerable code is not in the image, so it stays fixed even if some
-  # future code path tries to require it. The price is a Ruby build from source
-  # — a store path cannot be edited after the fact.
+  # The report is Markdown, and this is what turns it into HTML: GitHub's
+  # CommonMark implementation, a ~1 MB C library and a CLI on top of it, with no
+  # dependency beyond libc — which coreutils has already put in the image.
+  # Stock, with no override, because there is nothing in it to take out.
   #
-  # Two kinds, removed differently. "Bundled" gems are ordinary gems that live
-  # under gems/; these four are mail and file-transfer clients that a container
-  # converting AsciiDoc to HTML has no business carrying, and net-imap is what
-  # prompted this (CVE-2026-42257, IMAP command injection via CRLF, CVSS 9.8).
-  # net-http and net-protocol stay: open-uri needs them, and open-uri is how
-  # asciidoctor resolves an `include::` or an image over http.
+  # It is the whole reason the report is Markdown rather than AsciiDoc. The
+  # AsciiDoc renderer was asciidoctor, and asciidoctor is a Ruby program: the
+  # image carried a CRuby interpreter, bundler and a gem environment — the
+  # largest single thing in it after fio — to convert one document, and CRuby's
+  # bundled gems meant a rolling supply of scanner CVEs against mail and
+  # templating code no code path here could reach. Both are now simply absent.
   #
-  # "Default" gems like erb live in the stdlib tree with a stub gemspec, so they
-  # take a different set of paths. erb (CVE-2026-41316) is reachable from
-  # asciidoctor only through its custom-template converter, which needs -T on
-  # the command line; the script never passes it. Dropping erb is what makes
-  # `asciidoctor -T` unavailable in this image — put it back by deleting the
-  # erb lines below.
-  ruby = pkgs.ruby.overrideAttrs (old: {
-    postInstall = (old.postInstall or "") + ''
-      gemDir=$out/${old.passthru.gemPath}
-
-      for gem in net-imap net-pop net-smtp net-ftp; do
-        rm -rf "$gemDir"/gems/"$gem"-*
-        rm -f "$gemDir"/specifications/"$gem"-*.gemspec
-        rm -f "$gemDir"/cache/"$gem"-*.gem
-      done
-
-      # The globs cover the version and architecture directories, e.g.
-      # lib/ruby/3.4.0 and lib/ruby/3.4.0/x86_64-linux, without naming either.
-      rm -f "$gemDir"/specifications/default/erb-*.gemspec
-      rm -rf $out/lib/ruby/*/erb.rb $out/lib/ruby/*/erb $out/lib/ruby/*/*/erb
-      rm -f $out/bin/erb
-    '';
-  });
-
-  # nixpkgs' asciidoctor is a bundle: asciidoctor-pdf, prawn, a PDF reader, and
-  # three syntax highlighters, one of which (pygments.rb) shells out to CPython
-  # and so pins the same ~130 MB interpreter fio did. The report is rendered to
-  # HTML and nothing else, and plain asciidoctor is a single gem with no gem
-  # dependencies at all, so this is that one gem and a bundler wrapper.
+  # What comes with that is that cmark-gfm renders a fragment and nothing else:
+  # no document, no stylesheet, no table of contents, no section numbers and no
+  # way to inline an image. storage-bench.sh does those four itself, in awk, in
+  # its `decorate` function — that is where to look if the HTML comes out
+  # unstyled or without a contents pane.
   #
-  # Nothing here highlights source blocks — the report has none. Nothing here
-  # produces a PDF either; RENDER=pdf is gone from the script and the .adoc is
-  # kept so a host with asciidoctor-pdf can still make one.
-  #
-  # Bumping it: take version and sha256 from the same nixpkgs revision that
-  # nixpkgs.nix pins, out of pkgs/by-name/as/asciidoctor/gemset.nix. The version
-  # has to match in both places below or bundler refuses to resolve.
-  asciidoctorVersion = "2.0.26";
-  asciidoctor = pkgs.bundlerApp {
-    pname = "asciidoctor";
-    exes = [ "asciidoctor" ];
-    # The trimmed interpreter above, not pkgs.ruby. bundlerEnv rebuilds bundler
-    # against whatever it is given, so the image ends up with one Ruby, not two.
-    inherit ruby;
-
-    gemfile = pkgs.writeText "Gemfile" ''
-      source 'https://rubygems.org'
-      gem 'asciidoctor'
-    '';
-
-    lockfile = pkgs.writeText "Gemfile.lock" ''
-      GEM
-        remote: https://rubygems.org/
-        specs:
-          asciidoctor (${asciidoctorVersion})
-
-      PLATFORMS
-        ruby
-
-      DEPENDENCIES
-        asciidoctor
-
-      BUNDLED WITH
-         2.7.2
-    '';
-
-    gemset = {
-      asciidoctor = {
-        groups = [ "default" ];
-        platforms = [ ];
-        source = {
-          remotes = [ "https://rubygems.org" ];
-          sha256 = "1hbin3j8wynl2fpqa3d6vb932pyngyfn8j2q6gbbn1n23z7srqqn";
-          type = "gem";
-        };
-        version = asciidoctorVersion;
-      };
-    };
-  };
+  # `-e table` is what makes the results CSVs render as tables; it is a GFM
+  # extension rather than CommonMark, so plain `cmark` will not do.
+  cmark-gfm = pkgs.cmark-gfm;
 in
 {
   # Everything storage-bench.sh shells out to, plus the tool that renders its
   # report. gawk/gnugrep parse fio's terse output and dd's summary line, gnused
   # strips the unit off dd's elapsed time, and gawk also folds fio's time-series
-  # logs into the per-series data files that gnuplot draws.
+  # logs into the per-series data files that gnuplot draws — and assembles the
+  # HTML around cmark-gfm's output.
   #
   # coreutils covers more than it looks: `df` for the per-mount capacity in the
-  # report and `uname -n` for its host header, which is why there is no
-  # hostname(1) here. The mount table comes from /proc/mounts, which is why
-  # there is no util-linux either — it was carried for that one command, and
-  # the full build links PAM, systemd and shadow behind it.
+  # report, `uname -n` for its host header, which is why there is no hostname(1)
+  # here, and `base64` for inlining the graphs into the single-file HTML. The
+  # mount table comes from /proc/mounts, which is why there is no util-linux
+  # either — it was carried for that one command, and the full build links PAM,
+  # systemd and shadow behind it.
   packages = [
     fio
     gnuplot
-    asciidoctor
+    cmark-gfm
   ] ++ (with pkgs; [
     bashInteractive
     coreutils

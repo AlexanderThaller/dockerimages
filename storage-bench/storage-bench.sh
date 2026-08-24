@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # storage-bench.sh — dd + fio benchmark across one or more mounted PVCs,
-#                    emitting CSV data files and an AsciiDoctor report.
+#                    emitting CSV data files and a Markdown report.
 #
 # Usage:
 #   ./storage-bench.sh /data/ceph /data/portworx
 #   ORDER=by-test ./storage-bench.sh /data/ceph /data/portworx
 #
-# The graphs need gnuplot and the rendered report needs asciidoctor, neither of
+# The graphs need gnuplot and the rendered report needs cmark-gfm, neither of
 # which a host necessarily has; both are in the image, and shell.nix puts the
 # same set on a host:
 #   nix-shell --run './storage-bench.sh /tank/backup'
@@ -95,10 +95,10 @@ esac
   exit 1
 }
 
-# HTML only. A PDF would mean asciidoctor-pdf, and that gem pulls prawn, a PDF
-# reader and a syntax highlighter that shells out to CPython — roughly a fifth
-# of the image for an output format nobody was reading. The .adoc is kept next
-# to the HTML, so `asciidoctor-pdf` on any host that has it still gets you one.
+# HTML only. Anything else — PDF, DOCX — means pandoc, and pandoc is a Haskell
+# binary several times the size of everything else in this image put together,
+# for output formats nobody was reading. The Markdown is kept next to the HTML,
+# so pandoc on any host that has it still gets you one.
 case "$RENDER" in
 html | none) ;;
 *)
@@ -109,7 +109,7 @@ esac
 
 DD_CSV="$OUTDIR/dd_results.csv"
 FIO_CSV="$OUTDIR/fio_results.csv"
-ADOC="$OUTDIR/storage-benchmark-report.adoc"
+MD="$OUTDIR/storage-benchmark-report.md"
 RAWDIR="$OUTDIR/raw"
 LOGDIR="$OUTDIR/fio-logs" # fio's own time-series logs, one set per test
 PLOTDIR="$OUTDIR/graphs"  # the SVGs the report embeds
@@ -179,9 +179,9 @@ elif [ "$PLOT" = "1" ]; then
   MISSING+=("gnuplot — the report has no graphs")
 fi
 
-if [ "$RENDER" != "none" ] && ! command -v asciidoctor >/dev/null 2>&1; then
-  echo "NOTE asciidoctor not found in PATH — report stays as .adoc source" >&2
-  MISSING+=("asciidoctor — the report was not rendered")
+if [ "$RENDER" != "none" ] && ! command -v cmark-gfm >/dev/null 2>&1; then
+  echo "NOTE cmark-gfm not found in PATH — report stays as Markdown source" >&2
+  MISSING+=("cmark-gfm — the report was not rendered")
   RENDER=none
 fi
 
@@ -643,149 +643,169 @@ if [ "$have_gnuplot" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# AsciiDoctor report
+# Markdown report
+#
+# GitHub-Flavoured Markdown, which means the report is readable as-is in a
+# terminal, a pull request or an issue comment without being rendered at all —
+# the reason it is Markdown rather than AsciiDoc.
+#
+# The cost of that trade is paid here: Markdown has no `include::`, so the CSVs
+# have to be turned into tables by hand rather than referenced, and it has no
+# section numbering, table of contents, anchors or captions, all of which
+# render_html adds afterwards. Both files stay in the results directory — the
+# CSVs are still the machine-readable copy, the table below is the human one.
 # ---------------------------------------------------------------------------
+
+# A header-row CSV as a GFM table. The fields are plain — no quoting, no
+# embedded commas, because everything written to these CSVs is a number, a
+# mount path or the word FAILED — so splitting on commas is enough. Pipes are
+# escaped anyway, since a pipe is the one character that would silently split a
+# cell in two.
+csv_table() { # <csvfile>
+  awk -F, '
+    function row(  i, s) {
+      s = ""
+      for (i = 1; i <= NF; i++) {
+        gsub(/\|/, "\\|", $i)
+        s = s "| " $i " "
+      }
+      return s "|"
+    }
+    NR == 1 {
+      print row()
+      s = ""
+      for (i = 1; i <= NF; i++) s = s "| --- "
+      print s "|"
+      next
+    }
+    { print row() }
+  ' "$1"
+}
+
 log "Writing report"
 
 {
   cat <<EOF
-= Storage Benchmark Report
-:toc: left
-:toclevels: 2
-:icons: font
-:sectnums:
-:revdate: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+# Storage Benchmark Report
 
-[cols="1,3"]
-|===
-|Generated    |$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-|Total runtime|${ELAPSED}s
-|Host / pod   |$(uname -n)
-|Kernel       |$(uname -r)
-|Running as   |uid $(id -u), gid $(id -g)
-|fio version  |$(fio --version 2>/dev/null)
-|Mounts under test |${USABLE[*]}
-|Run order    |$ORDER
-|===
+| Property | Value |
+| -------- | ----- |
+| Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+| Total runtime     | ${ELAPSED}s |
+| Host / pod        | $(uname -n) |
+| Kernel            | $(uname -r) |
+| Running as        | uid $(id -u), gid $(id -g) |
+| fio version       | $(fio --version 2>/dev/null) |
+| Mounts under test | ${USABLE[*]} |
+| Run order         | $ORDER |
 
-== Test parameters
+## Test parameters
 
-[cols="1,1"]
-|===
-|Parameter |Value
+| Parameter | Value |
+| --------- | ----- |
+| Run order             | ${ORDER} |
+| Settle between runs   | ${SETTLE}s |
+| dd zero write size    | ${DD_ZERO_MB} MiB |
+| dd urandom write size | ${DD_RAND_MB} MiB |
+| fio working set       | ${FIO_SIZE} |
+| fio runtime per job   | ${FIO_RUNTIME}s |
+| fio ioengine          | ${IOENGINE} |
+| fio log sample window | ${LOG_AVG_MSEC}ms |
 
-|Run order             |${ORDER}
-|Settle between runs   |${SETTLE}s
-|dd zero write size    |${DD_ZERO_MB} MiB
-|dd urandom write size |${DD_RAND_MB} MiB
-|fio working set       |${FIO_SIZE}
-|fio runtime per job   |${FIO_RUNTIME}s
-|fio ioengine          |${IOENGINE}
-|fio log sample window |${LOG_AVG_MSEC}ms
-|===
-
-== Reading these numbers
+## Reading these numbers
 
 * Run order was \`${ORDER}\`. In \`by-mount\` each mount gets an uninterrupted block of tests; in \`by-test\` the mounts are paired closely in time so shared backend load hits both about equally. If the two paths share physical hardware, \`by-test\` is the fairer head-to-head.
 * A ${SETTLE}s idle period separates consecutive runs so the backend can finish flushing before the next measurement starts.
-* What each fio job measures, and the exact command it ran, is in <<fio-tests,fio tests>> — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
-* The \`dd_write_urandom\` figure is *CPU-bound in most environments* — \`/dev/urandom\` generation, not the disk, is usually the limiting factor. Treat it as a check on how the backend handles incompressible data (relevant if it does inline compression or dedup), not as a throughput measurement.
+* What each fio job measures, and the exact command it ran, is in [fio tests](#fio-tests) — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
+* The \`dd_write_urandom\` figure is **CPU-bound in most environments** — \`/dev/urandom\` generation, not the disk, is usually the limiting factor. Treat it as a check on how the backend handles incompressible data (relevant if it does inline compression or dedup), not as a throughput measurement.
 * \`dd_read_direct\` bypasses the page cache. If it appears as \`dd_read_cached\` instead, the filesystem rejected O_DIRECT and that number is inflated by RAM caching.
 * If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\`.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
-* The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. That is what the <<over-time,time series>> section is for.
+* The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. That is what the [time series](#over-time) section is for.
 
-== Mount points
+## Mount points
 
 EOF
 
   for mp in "${USABLE[@]}"; do
     sl="$(slug "$mp")"
-    echo "=== $mp"
+    echo "### $mp"
     echo
-    echo "[source,text]"
-    echo "----"
+    echo '```text'
     cat "$RAWDIR/df_${sl}.txt" 2>/dev/null
     echo
     cat "$RAWDIR/mount_${sl}.txt" 2>/dev/null
-    echo "----"
+    echo '```'
     echo
   done
 
-  cat <<'ADOCEOF'
-== dd results
+  cat <<'MDEOF'
+## dd results
 
 Sequential, single-stream. Writes use `conv=fdatasync` so the data is committed
 before dd reports its timing. Rows appear in execution order.
 
-[format=csv,options="header",cols="2,2,1,1,1"]
-|===
-include::dd_results.csv[]
-|===
+MDEOF
 
-ADOCEOF
+  csv_table "$DD_CSV"
+  echo
 
   # ---- what each fio job actually ran ------------------------------------
   cat <<EOF
-[#fio-tests]
-== fio tests
+## fio tests
 
 ${#FIO_TESTS[@]} jobs, each isolating one thing the storage can be bad at. Every
 one of them is also given these flags, which are what make the numbers
 comparable:
 
-\`--direct=1\`:: O_DIRECT, so reads and writes go to the backend instead of
-being served by the page cache. Without it most of these tests would be
-measuring RAM.
-\`--time_based --runtime=${FIO_RUNTIME}\`:: each job runs for a fixed ${FIO_RUNTIME} seconds,
-looping over its file if it finishes early. Every mount therefore gets equal
-*time* rather than equal *bytes*, so a slow backend cannot shorten its own run.
-\`--ioengine=${IOENGINE}\`:: how I/O is submitted to the kernel; an asynchronous
-engine such as the default \`libaio\` is what lets a queue depth above 1 mean
-anything. The commit-latency test overrides it with \`psync\`, which blocks on
-each write, because blocking is the thing it is measuring.
-\`--group_reporting\`:: with more than one worker, report the aggregate rather
-than each worker separately.
-\`--directory\`:: the mount under test. It is the only flag that differs between
-mounts — everything below is identical for all of them.
+* \`--direct=1\` — O_DIRECT, so reads and writes go to the backend instead of
+  being served by the page cache. Without it most of these tests would be
+  measuring RAM.
+* \`--time_based --runtime=${FIO_RUNTIME}\` — each job runs for a fixed ${FIO_RUNTIME} seconds,
+  looping over its file if it finishes early. Every mount therefore gets equal
+  **time** rather than equal **bytes**, so a slow backend cannot shorten its own run.
+* \`--ioengine=${IOENGINE}\` — how I/O is submitted to the kernel; an asynchronous
+  engine such as the default \`libaio\` is what lets a queue depth above 1 mean
+  anything. The commit-latency test overrides it with \`psync\`, which blocks on
+  each write, because blocking is the thing it is measuring.
+* \`--group_reporting\` — with more than one worker, report the aggregate rather
+  than each worker separately.
+* \`--directory\` — the mount under test. It is the only flag that differs between
+  mounts — everything below is identical for all of them.
 
 The command shown under each test is the one that ran, recorded as it ran.
 
 EOF
 
   for t in "${FIO_TESTS[@]}"; do
-    echo "=== $t"
+    echo "### $t"
     echo
     fio_test_purpose "$t"
     echo
     if [ -n "${FIO_ARGS[$t]:-}" ]; then
-      echo "[source,console]"
-      echo "----"
+      echo '```console'
       echo "\$ fio --directory=<mount> ${FIO_ARGS[$t]}"
-      echo "----"
+      echo '```'
       echo
     fi
   done
 
-  cat <<'ADOCEOF'
-== fio results
+  cat <<'MDEOF'
+## fio results
 
 Rows appear in execution order.
 
-[format=csv,options="header"]
-|===
-include::fio_results.csv[]
-|===
-ADOCEOF
+MDEOF
+
+  csv_table "$FIO_CSV"
 
   # ---- time series ------------------------------------------------------
   cat <<EOF
 
-[#over-time]
-== Over time
+## Over time
 
 Every fio job also logs itself as a time series, one sample per
-${LOG_AVG_MSEC}ms window. The x axis is elapsed time *within that job*, so runs
+${LOG_AVG_MSEC}ms window. The x axis is elapsed time **within that job**, so runs
 on different mounts line up even when they were minutes apart on the clock.
 
 Where a job does both reads and writes (\`rand_rw_70_30_4k\`) each direction is
@@ -808,14 +828,16 @@ EOF
       [ -f "$PLOTDIR/${t}_bw.svg" ] ||
       [ -f "$PLOTDIR/${t}_clat.svg" ] || continue
     graphed=1
-    echo "=== $t"
+    echo "### $t"
     echo
     for spec in "iops:IOPS" "bw:Bandwidth" "clat:Completion latency"; do
       key="${spec%%:*}"
       cap="${spec#*:}"
       [ -f "$PLOTDIR/${t}_${key}.svg" ] || continue
-      echo ".${cap} — ${t}"
-      echo "image::graphs/${t}_${key}.svg[\"${cap} over time, ${t}\",align=\"center\"]"
+      # The alt text doubles as the caption: render_html lifts a paragraph that
+      # holds nothing but an image into a <figure> and reuses it as the
+      # <figcaption>, which is as close as Markdown gets to AsciiDoc's `.Title`.
+      echo "![${cap} — ${t}](graphs/${t}_${key}.svg)"
       echo
     done
   done
@@ -832,8 +854,8 @@ EOF
     echo
   fi
 
-  cat <<'ADOCEOF'
-== Raw output
+  cat <<'MDEOF'
+## Raw output
 
 Unparsed dd output and fio terse lines are archived under `raw/`, one file per
 test per mount. The fio files are terse version 3 records — useful if you want
@@ -853,36 +875,272 @@ benchmark image would otherwise carry.
 data files that produced each one, so any plot can be tweaked and redrawn
 without re-running the benchmark:
 
-[source,console]
-----
+```console
 $ gnuplot graphs/rand_read_4k_iops.gp
-----
-ADOCEOF
-} >"$ADOC"
+```
+MDEOF
+} >"$MD"
 
 # ---------------------------------------------------------------------------
 # Render
 #
-# -a data-uri inlines the SVGs, which makes the HTML a single file you can mail
-# or copy out of a pod without dragging graphs/ along with it.
+# cmark-gfm turns the Markdown into an HTML fragment and nothing else — no
+# document, no stylesheet, no table of contents, and no way to inline an image.
+# It is chosen for exactly that: it is a ~1 MB C program with no dependencies
+# beyond libc, where the alternatives are a Ruby or a Haskell runtime, either of
+# which would be the largest thing in the image by a wide margin. The three
+# things it does not do are done below instead.
+#
+# The result is one self-contained file: the stylesheet is embedded and every
+# graph is inlined as a data: URI, so the HTML can be mailed or copied out of a
+# pod on its own without dragging graphs/ along with it.
 # ---------------------------------------------------------------------------
+
+# The page shell. Light and dark are both styled because this is read in a
+# browser, but graph figures keep a white plate in either: the SVGs gnuplot
+# writes have a hard-coded white background (see plot_metric) and black axis
+# text, so they need one.
+html_head() {
+  cat <<'MDEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Benchmark Report</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fff; --fg: #1c1e21; --muted: #62676c; --rule: #dcdfe3;
+  --accent: #1a6ec4; --code-bg: #f4f5f7; --head-bg: #eef1f4; --toc-bg: #fafbfc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c; --fg: #d5d9de; --muted: #979ca3; --rule: #2f333a;
+    --accent: #6cb0f0; --code-bg: #1e2126; --head-bg: #22262c; --toc-bg: #1a1d21;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+#toc {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 19rem; overflow-y: auto;
+  padding: 1.5rem 1rem; background: var(--toc-bg);
+  border-right: 1px solid var(--rule); font-size: 0.875rem;
+}
+.toc-title {
+  margin: 0 0 0.75rem; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; font-size: 0.75rem; color: var(--muted);
+}
+#toc ul { list-style: none; margin: 0; padding: 0; }
+#toc li { margin: 0.15rem 0; }
+#toc a { color: var(--fg); text-decoration: none; display: block; padding: 0.1rem 0; }
+#toc a:hover { color: var(--accent); text-decoration: underline; }
+#toc .toc-l3 { padding-left: 1.1rem; color: var(--muted); }
+#toc .secnum { color: var(--muted); margin-right: 0.35rem; }
+
+#content { max-width: 62rem; margin: 0 0 0 19rem; padding: 2.5rem 2.5rem 6rem; }
+@media (max-width: 60rem) {
+  #toc { position: static; width: auto; height: auto; border-right: 0;
+         border-bottom: 1px solid var(--rule); }
+  #content { margin-left: 0; padding: 1.5rem 1.25rem 4rem; }
+}
+
+h1, h2, h3 { line-height: 1.25; font-weight: 600; }
+h1 { font-size: 2rem; margin: 0 0 1.5rem; }
+h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; padding-bottom: 0.3rem;
+     border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.15rem; margin: 2rem 0 0.75rem; }
+h2 .secnum, h3 .secnum { color: var(--muted); font-weight: 400; margin-right: 0.4rem; }
+
+a { color: var(--accent); }
+p, ul, ol { margin: 0 0 1rem; }
+li { margin: 0.25rem 0; }
+
+.tablewrap { overflow-x: auto; margin: 0 0 1.25rem; }
+table { border-collapse: collapse; font-size: 0.9rem; }
+th, td { border: 1px solid var(--rule); padding: 0.35rem 0.7rem; text-align: left;
+         white-space: nowrap; }
+thead th { background: var(--head-bg); font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--code-bg); }
+
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 0.75rem 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.45;
+  margin: 0 0 1.25rem;
+}
+pre code { background: none; padding: 0; }
+code { background: var(--code-bg); border-radius: 3px; padding: 0.1em 0.2em;
+       font-size: 0.875em; }
+
+figure { margin: 0 0 1.75rem; }
+figure img {
+  display: block; width: 100%; height: auto; background: #fff;
+  border: 1px solid var(--rule); border-radius: 4px; padding: 0.25rem;
+}
+figcaption { margin-top: 0.4rem; font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+MDEOF
+}
+
+html_foot() {
+  printf '</body>\n</html>\n'
+}
+
+# cmark-gfm's fragment, plus the four things it leaves out: heading ids,
+# section numbers, a table of contents, and inlined images. Everything is held
+# in memory because the contents page has to be printed before the body it was
+# built from; the fragment is a few hundred KiB, the graphs are not in it yet.
+decorate() { # <data-uri map>
+  awk -v mapfile="$1" '
+    BEGIN {
+      while ((getline ln < mapfile) > 0) {
+        i = index(ln, "\t")
+        if (i > 0) uri[substr(ln, 1, i - 1)] = substr(ln, i + 1)
+      }
+      close(mapfile)
+    }
+
+    # Anchors are GitHub-compatible — lowercased, punctuation dropped, spaces
+    # hyphenated, duplicates suffixed -1, -2 — so the intra-document links in
+    # the Markdown resolve both here and when the .md is viewed on a forge.
+    function striptags(s) { gsub(/<[^>]*>/, "", s); return s }
+    function slugify(s,   t) {
+      t = striptags(s)
+      gsub(/&[#0-9a-zA-Z]+;/, "", t)
+      t = tolower(t)
+      gsub(/[^a-z0-9 _-]/, "-", t)
+      gsub(/ +/, "-", t)
+      gsub(/-+/, "-", t)
+      sub(/^-/, "", t)
+      sub(/-$/, "", t)
+      return t
+    }
+    function inline_uris(s,   k) {
+      if (!index(s, "src=\"graphs/")) return s
+      for (k in uri) gsub("src=\"" k "\"", "src=\"" uri[k] "\"", s)
+      return s
+    }
+
+    { line[++n] = $0 }
+
+    END {
+      for (i = 1; i <= n; i++) {
+        if (line[i] !~ /^<h[23][^>]*>/) continue
+        lvl = substr(line[i], 3, 1) + 0
+        inner = line[i]
+        sub(/^<h[23][^>]*>/, "", inner)
+        sub(/<\/h[23]>[ \t]*$/, "", inner)
+
+        base = slugify(inner)
+        if (base == "") base = "section"
+        if (base in seen) { id = base "-" seen[base]; seen[base]++ }
+        else { id = base; seen[base] = 1 }
+
+        if (lvl == 2) { n2++; n3 = 0; num = n2 "." }
+        else { n3++; num = n2 "." n3 "." }
+
+        hlvl[i] = lvl; hid[i] = id; hnum[i] = num; htxt[i] = inner
+        toc[++tn] = sprintf("<li class=\"toc-l%d\">" \
+          "<a href=\"#%s\"><span class=\"secnum\">%s</span>%s</a></li>",
+          lvl, id, num, inner)
+      }
+
+      print "<nav id=\"toc\" aria-label=\"Contents\">"
+      print "<p class=\"toc-title\">Contents</p>"
+      if (tn > 0) {
+        print "<ul>"
+        for (i = 1; i <= tn; i++) print toc[i]
+        print "</ul>"
+      }
+      print "</nav>"
+
+      print "<main id=\"content\">"
+      for (i = 1; i <= n; i++) {
+        l = line[i]
+
+        if (i in hid) {
+          printf "<h%d id=\"%s\"><span class=\"secnum\">%s</span>%s</h%d>\n",
+            hlvl[i], hid[i], hnum[i], htxt[i], hlvl[i]
+          continue
+        }
+
+        # A paragraph containing nothing but an image becomes a captioned
+        # figure, with the alt text serving as the caption.
+        if (l ~ /^<p><img [^>]*\/><\/p>$/) {
+          img = l
+          sub(/^<p>/, "", img)
+          sub(/<\/p>$/, "", img)
+          alt = ""
+          if (match(img, /alt="[^"]*"/))
+            alt = substr(img, RSTART + 5, RLENGTH - 6)
+          print "<figure>" inline_uris(img) \
+            (alt == "" ? "" : "<figcaption>" alt "</figcaption>") "</figure>"
+          continue
+        }
+
+        # Wide tables (fio results is eight columns) scroll inside their own
+        # box rather than pushing the page sideways.
+        if (l == "<table>") { print "<div class=\"tablewrap\">"; print l; continue }
+        if (l == "</table>") { print l; print "</div>"; continue }
+
+        print inline_uris(l)
+      }
+      print "</main>"
+    }
+  '
+}
+
+render_html() { # <markdown> <html out>
+  local md="$1" out="$2"
+  local map="$RAWDIR/graph-data-uri.map" f rc
+
+  # base64 rather than inlining the SVG markup: gnuplot gives every plot the
+  # same element ids, and a dozen inline <svg> blocks sharing one id space would
+  # have each of them resolve its <defs> references to the first plot on the
+  # page. A data: URI keeps each graph in its own document, as a separate file
+  # would have.
+  : >"$map"
+  for f in "$PLOTDIR"/*.svg; do
+    [ -f "$f" ] || continue
+    printf '%s\t%s\n' "graphs/${f##*/}" \
+      "data:image/svg+xml;base64,$(base64 -w0 "$f")" >>"$map"
+  done
+
+  {
+    html_head
+    cmark-gfm --unsafe -e table -e autolink "$md" | decorate "$map"
+    html_foot
+  } >"$out"
+  rc=$?
+
+  rm -f "$map"
+  return $rc
+}
+
 HTML=""
 
 if [ "$RENDER" = "html" ]; then
   log "Rendering report"
   info "HTML ..."
   html_out="$OUTDIR/storage-benchmark-report.html"
-  if asciidoctor -a data-uri -o "$html_out" "$ADOC" >"$RAWDIR/asciidoctor.log" 2>&1 &&
+  if render_html "$MD" "$html_out" 2>"$RAWDIR/render.log" &&
     [ -s "$html_out" ]; then
     HTML="$html_out"
   else
-    info "  FAILED (see $RAWDIR/asciidoctor.log)"
+    info "  FAILED (see $RAWDIR/render.log)"
   fi
 fi
 
 echo
 echo "Done in ${ELAPSED}s."
-echo "  Report   : $ADOC"
+echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
 echo "  CSVs     : $DD_CSV"
 echo "             $FIO_CSV"
@@ -907,7 +1165,8 @@ fi
 
 if [ -z "$HTML" ]; then
   echo
-  echo "Render with:"
-  echo "  asciidoctor -a data-uri $ADOC       # -> single-file HTML"
-  echo "  asciidoctor-pdf $ADOC               # -> PDF, needs asciidoctor-pdf"
+  echo "The Markdown is readable as it stands. To render it elsewhere, from $OUTDIR"
+  echo "so that the relative graphs/ paths resolve:"
+  echo "  pandoc -s --toc --embed-resources -o report.html storage-benchmark-report.md"
+  echo "  pandoc -o report.pdf storage-benchmark-report.md   # -> PDF, needs a TeX engine"
 fi
