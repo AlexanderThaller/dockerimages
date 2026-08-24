@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r2"
+tag := "2026-08-24-r3"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.

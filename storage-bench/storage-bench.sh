@@ -286,6 +286,12 @@ ensure_passwd_entry() {
   has_passwd_entry
 }
 
+# Read whether or not the workload ends up running: the report header states
+# what postgres is in the image, which is a different question from whether it
+# was used, and `PGBENCH=0` should not blank out the answer.
+PG_VERSION="$(postgres --version 2>/dev/null | awk '{print $NF}')"
+[ -n "$PG_VERSION" ] || PG_VERSION="not present"
+
 have_pgbench=0
 if [ "$PGBENCH" = "1" ]; then
   if [ "$(id -u)" -eq 0 ]; then
@@ -302,8 +308,6 @@ if [ "$PGBENCH" = "1" ]; then
     MISSING+=("passwd entry for uid $(id -u) — the pgbench workload did not run")
   else
     have_pgbench=1
-    PG_VERSION="$(postgres --version 2>/dev/null | awk '{print $NF}')"
-    [ -n "$PG_VERSION" ] || PG_VERSION="(unknown version)"
   fi
 fi
 
@@ -1079,6 +1083,7 @@ log "Writing report"
 | Kernel            | $(uname -r) |
 | Running as        | uid $(id -u), gid $(id -g) |
 | fio version       | $(fio --version 2>/dev/null) |
+| postgres version  | ${PG_VERSION} |
 | Mounts under test | ${USABLE[*]} |
 | Run order         | $ORDER |
 
