@@ -33,8 +33,13 @@
 #
 # Each pass writes its own results, and the graphs are produced twice over: once
 # per pass, and once aggregated across passes as a mean with the spread drawn
-# behind it. With one pass, which is the default, there is nothing to aggregate
-# and the output is exactly what it always was.
+# behind it. The spread is the reason the default is three rather than one: a
+# single pass cannot distinguish a slow backend from a backend that was slow
+# once, and it reports that unlucky number with just as much confidence.
+#
+# Three passes therefore cost roughly three times the wall clock of one. REPEATS=1
+# restores the old behaviour and skips the aggregate entirely, since there would
+# be nothing to average.
 #
 # Tunables (env vars):
 #   OUTBASE       directory the run dir goes in (default /tmp)
@@ -43,7 +48,7 @@
 #                                                set it empty to write straight
 #                                                into OUTBASE)
 #   ORDER         by-mount | by-test            (default by-mount)
-#   REPEATS       times to run the whole suite  (default 1)
+#   REPEATS       times to run the whole suite  (default 3)
 #   SETTLE        seconds to idle between runs  (default 15)
 #   DD_ZERO_MB    size of the dd zero write     (default 1024)
 #   DD_RAND_MB    size of the dd urandom write  (default 256)
@@ -89,7 +94,7 @@ OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
 RUNDIR="${RUNDIR-bench-results-$TS}"
 OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
-REPEATS="${REPEATS:-1}"
+REPEATS="${REPEATS:-3}"
 SETTLE="${SETTLE:-15}"
 DD_ZERO_MB="${DD_ZERO_MB:-10240}"
 DD_RAND_MB="${DD_RAND_MB:-10240}"

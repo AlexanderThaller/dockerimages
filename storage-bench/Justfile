@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r4"
+tag := "2026-08-24-r5"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -128,6 +128,11 @@ shell: load
 # timestamped directory on every invocation. pgbench is pinned to scale 5 here
 # rather than the default 100: the tmpfs is RAM, and 1.6 GB of it is not what a
 # smoke test should cost.
+#
+# REPEATS=2 rather than the default 3, or 1: two passes is the cheapest number
+# that still exercises the per-pass directories and the aggregate charts, which
+# a single pass skips entirely and which are therefore exactly what a smoke test
+# should be covering.
 
 # Tiny end-to-end run to prove the image works.
 smoke: load
@@ -138,7 +143,7 @@ smoke: load
         --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
         -v {{ results }}/smoke:/out -e OUTBASE=/out -e RUNDIR= \
         -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
-        -e FIO_SIZE=64M -e FIO_RUNTIME=2 \
+        -e FIO_SIZE=64M -e FIO_RUNTIME=2 -e REPEATS=2 \
         -e PGBENCH_SCALE=5 -e PGBENCH_CLIENTS=4 -e PGBENCH_JOBS=2 -e PGBENCH_TIME=5 \
         {{ run_args }} \
         {{ image }}:{{ tag }} /data/a /data/b
