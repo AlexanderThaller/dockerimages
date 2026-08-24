@@ -50,6 +50,7 @@
 #   ORDER         by-mount | by-test            (default by-mount)
 #   REPEATS       times to run the whole suite  (default 3)
 #   SETTLE        seconds to idle between runs  (default 15)
+#   TEST_SETTLE   seconds to idle between tests (default 1)
 #   FIO_SIZE      fio working set per job       (default 2G)
 #   FIO_RUNTIME   seconds per fio job           (default 30)
 #   IOENGINE      fio ioengine                  (default libaio)
@@ -58,7 +59,11 @@
 #   PGBENCH_SCALE pgbench scale factor          (default 100, ~1.6 GiB)
 #   PGBENCH_CLIENTS  concurrent pgbench clients (default 8)
 #   PGBENCH_JOBS  pgbench worker threads        (default 4)
-#   PGBENCH_TIME  seconds of timed pgbench run  (default 60)
+#   PGBENCH_TIME  seconds of measured pgbench   (default 300)
+#   PGBENCH_WARMUP   seconds of unmeasured run
+#                 before it                     (default 30)
+#   PGBENCH_MODE  simple | extended | prepared  (default prepared)
+#   PGBENCH_MAX_WAL  postgres max_wal_size      (default 4GB)
 #   PLOT          1|0, draw the gnuplot graphs  (default 1)
 #   RENDER        html|none                     (default html)
 #
@@ -104,6 +109,16 @@ OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
 REPEATS="${REPEATS:-3}"
 SETTLE="${SETTLE:-15}"
+
+# A short pause between consecutive tests on the same mount. SETTLE is the long
+# cooldown between whole runs; this is the small one between the jobs inside a
+# run, where there used to be no gap at all. A test that ends with a queue of
+# dirty pages still being written back would otherwise have that writeback
+# land inside the first samples of the test after it — visible on the graphs as
+# a start that is slower than the rest of the run and belongs to the previous
+# job. One second is enough to drain what a fio job leaves behind; it is not
+# enough to let a backend recover, which is what SETTLE is for.
+TEST_SETTLE="${TEST_SETTLE:-1}"
 FIO_SIZE="${FIO_SIZE:-10G}"
 FIO_RUNTIME="${FIO_RUNTIME:-60}"
 IOENGINE="${IOENGINE:-libaio}"
@@ -112,7 +127,32 @@ PGBENCH="${PGBENCH:-1}"
 PGBENCH_SCALE="${PGBENCH_SCALE:-100}"
 PGBENCH_CLIENTS="${PGBENCH_CLIENTS:-8}"
 PGBENCH_JOBS="${PGBENCH_JOBS:-4}"
-PGBENCH_TIME="${PGBENCH_TIME:-60}"
+PGBENCH_TIME="${PGBENCH_TIME:-300}"
+
+# An unmeasured run before the measured one. The first seconds of a pgbench run
+# are not the workload: the caches are cold, the WAL has just been recycled and
+# no checkpoint has happened yet, so the transaction rate starts high and decays
+# into whatever the storage can actually sustain. Measuring from cold reports
+# that decay as if it were the result. The warmup absorbs it, and the measured
+# run then starts in the state the database would be in after a few minutes of
+# real traffic. Set it to 0 to measure from cold deliberately.
+PGBENCH_WARMUP="${PGBENCH_WARMUP:-30}"
+
+# Query protocol. pgbench's default is `simple`, which sends every statement as
+# text and has the server parse and plan it again each time — at which point a
+# good deal of what is being measured is postgres parsing SQL rather than the
+# storage underneath it. Real applications and every connection pooler use
+# prepared statements, so `prepared` both loads the storage harder and looks
+# more like production. `simple` and `extended` are still available for
+# comparison.
+PGBENCH_MODE="${PGBENCH_MODE:-prepared}"
+
+# postgres checkpoints when max_wal_size is reached, and the 1 GB default means
+# a mount that can absorb writes quickly checkpoints every few seconds — a
+# pathology of the default rather than anything a tuned database does, and it
+# dominates the run. 4 GB is a conservative production setting and gives a
+# checkpoint cadence the graphs can actually show as an event.
+PGBENCH_MAX_WAL="${PGBENCH_MAX_WAL:-4GB}"
 PLOT="${PLOT:-1}"
 RENDER="${RENDER:-html}"
 
@@ -179,6 +219,23 @@ for v in REPEATS PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME; do
     exit 1
   }
 done
+
+# Zero is meaningful for the warmup — it is how you ask to measure from cold —
+# so it is checked separately from the ones that must be at least one.
+case "$PGBENCH_WARMUP" in
+'' | *[!0-9]*)
+  echo "PGBENCH_WARMUP must be a non-negative integer (got '$PGBENCH_WARMUP')" >&2
+  exit 1
+  ;;
+esac
+
+case "$PGBENCH_MODE" in
+simple | extended | prepared) ;;
+*)
+  echo "PGBENCH_MODE must be one of simple|extended|prepared (got '$PGBENCH_MODE')" >&2
+  exit 1
+  ;;
+esac
 
 # pgbench divides its clients between its threads and refuses the run outright
 # if the division leaves a thread with none.
@@ -283,6 +340,13 @@ settle() {
   [ "$SETTLE" -gt 0 ] 2>/dev/null || return 0
   info "settling ${SETTLE}s..."
   sleep "$SETTLE"
+}
+
+# Quieter than settle(): it runs between every pair of tests, so announcing
+# itself each time would bury the results it sits between.
+test_settle() {
+  [ "$TEST_SETTLE" -gt 0 ] 2>/dev/null || return 0
+  sleep "$TEST_SETTLE"
 }
 
 # ---------------------------------------------------------------------------
@@ -399,7 +463,7 @@ fi
 
 echo "Benchmarking : ${USABLE[*]}"
 echo "Run order    : $ORDER"
-echo "Settle       : ${SETTLE}s between runs"
+echo "Settle       : ${SETTLE}s between runs, ${TEST_SETTLE}s between tests"
 echo "Results dir  : $OUTDIR"
 
 # The line in /proc/mounts for the filesystem a path is *on*: the longest mount
@@ -444,7 +508,7 @@ done
 
 echo "run,mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
 [ "$have_pgbench" = 1 ] &&
-  echo "run,mount,scale,clients,threads,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
+  echo "run,mount,scale,clients,threads,mode,warmup_s,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
 
 # ---------------------------------------------------------------------------
 # fio helper
@@ -524,6 +588,7 @@ pg_conf_args() {
     "-c fsync=on " \
     "-c synchronous_commit=on " \
     "-c full_page_writes=on " \
+    "-c max_wal_size=$PGBENCH_MAX_WAL " \
     "-c max_connections=$((PGBENCH_CLIENTS + 8))"
 }
 
@@ -536,7 +601,7 @@ run_pgbench() { # <mount>
   prefix="$LOGDIR/pgbench_${sl}"
   raw="$RAWDIR/pgbench_${sl}.txt"
 
-  local failrow="$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,FAILED,FAILED,FAILED,FAILED,FAILED"
+  local failrow="$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_MODE,$PGBENCH_WARMUP,$PGBENCH_TIME,FAILED,FAILED,FAILED,FAILED,FAILED"
 
   # A cluster left behind by an earlier run would mean measuring a load that
   # never happened, so each run starts from initdb.
@@ -590,14 +655,39 @@ run_pgbench() { # <mount>
   [ -z "$init_s" ] && init_s="n/a"
   info "  loaded in ${init_s}s"
 
+  # ---- warmup ----------------------------------------------------------
+  # Unlogged and unmeasured, purely to get the cluster out of its cold start:
+  # the buffer cache filled, the WAL past its first recycle, and at least one
+  # checkpoint behind it. Its output is kept in raw/ so the discarded numbers
+  # can still be compared against the measured ones.
+  if [ "$PGBENCH_WARMUP" -gt 0 ]; then
+    info "pgbench warmup (${PGBENCH_WARMUP}s, not measured) ..."
+    printf '\n=== warmup, not measured ===\n' >>"$raw"
+    out="$(pgbench -h "$PG_SOCKDIR" -U postgres \
+      -c "$PGBENCH_CLIENTS" -j "$PGBENCH_JOBS" -T "$PGBENCH_WARMUP" \
+      -M "$PGBENCH_MODE" bench 2>&1)"
+    printf '%s\n' "$out" >>"$raw"
+    info "  warmed at $(printf '%s\n' "$out" | sed -n 's/^tps = \([0-9.]*\).*/\1/p' | tail -1) tps"
+  fi
+
   # ---- timed run -------------------------------------------------------
   # --log with --aggregate-interval gives one row per interval per thread,
   # which pgbench_series folds back together for the graphs. Without the
   # aggregate it would log every single transaction — millions of lines.
-  info "pgbench run (${PGBENCH_CLIENTS} clients, ${PGBENCH_TIME}s) ..."
+  #
+  # --no-vacuum because the warmup has just left the tables in the state a
+  # running database is in, and pgbench's default pre-run vacuum would undo
+  # exactly that. With no warmup the cluster was freshly loaded and pgbench
+  # vacuums as part of the load, so there is nothing for it to do either way.
+  #
+  # -P prints a progress line to the raw output; on a run measured in minutes
+  # it is the only sign it is still alive.
+  info "pgbench run (${PGBENCH_CLIENTS} clients, ${PGBENCH_MODE}, ${PGBENCH_TIME}s) ..."
+  printf '\n=== measured run ===\n' >>"$raw"
   rm -f "$prefix".*
   out="$(pgbench -h "$PG_SOCKDIR" -U postgres \
     -c "$PGBENCH_CLIENTS" -j "$PGBENCH_JOBS" -T "$PGBENCH_TIME" \
+    -M "$PGBENCH_MODE" --no-vacuum -P 10 \
     --log --log-prefix="$prefix" \
     --aggregate-interval="$PGBENCH_AGG_INTERVAL" bench 2>&1)"
   rc=$?
@@ -623,7 +713,7 @@ run_pgbench() { # <mount>
   [ -z "$failed" ] && failed=0
 
   info "  $tps tps, ${lat}ms mean latency"
-  echo "$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,$init_s,$tps,$lat,$txns,$failed" >>"$PG_CSV"
+  echo "$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_MODE,$PGBENCH_WARMUP,$PGBENCH_TIME,$init_s,$tps,$lat,$txns,$failed" >>"$PG_CSV"
 
   # The cluster is ~16 MiB per scale point and the next mount wants the space.
   rm -rf "$pgdata"
@@ -754,7 +844,14 @@ for pass in $(seq 1 "$REPEATS"); do
       }
       first_mount=0
       log "$mp"
+      first_test=1
       for t in "${TESTS[@]}"; do
+        # The gap between consecutive tests on one mount. Without it a test
+        # begins while the previous one's writeback is still in flight, and
+        # that shows up in its first samples as the storage being slower than
+        # it is.
+        [ $first_test -eq 0 ] && test_settle
+        first_test=0
         run_test "$mp" "$t"
       done
     done
@@ -763,6 +860,8 @@ for pass in $(seq 1 "$REPEATS"); do
     for t in "${TESTS[@]}"; do
       log "$t"
       for mp in "${USABLE[@]}"; do
+        # by-test already pauses between every (test, mount) unit, and SETTLE
+        # is longer than TEST_SETTLE would be, so there is nothing to add here.
         [ $first_unit -eq 0 ] && settle
         first_unit=0
         info "-> $mp"
@@ -1445,16 +1544,17 @@ log "Writing report"
 | Run order             | ${ORDER} |
 | Passes over the suite | ${REPEATS} |
 | Settle between runs   | ${SETTLE}s |
+| Settle between tests  | ${TEST_SETTLE}s |
 | fio working set       | ${FIO_SIZE} |
 | fio runtime per job   | ${FIO_RUNTIME}s |
 | fio ioengine          | ${IOENGINE} |
 | fio log sample window | ${LOG_AVG_MSEC}ms |
-| pgbench               | $([ "$have_pgbench" = 1 ] && echo "scale ${PGBENCH_SCALE}, ${PGBENCH_CLIENTS} clients, ${PGBENCH_JOBS} threads, ${PGBENCH_TIME}s" || echo "not run") |
+| pgbench               | $([ "$have_pgbench" = 1 ] && echo "scale ${PGBENCH_SCALE}, ${PGBENCH_CLIENTS} clients, ${PGBENCH_JOBS} threads, ${PGBENCH_MODE}, ${PGBENCH_WARMUP}s warmup + ${PGBENCH_TIME}s measured" || echo "not run") |
 
 ## Reading these numbers
 
 * Run order was \`${ORDER}\`. In \`by-mount\` each mount gets an uninterrupted block of tests; in \`by-test\` the mounts are paired closely in time so shared backend load hits both about equally. If the two paths share physical hardware, \`by-test\` is the fairer head-to-head.
-* A ${SETTLE}s idle period separates consecutive runs so the backend can finish flushing before the next measurement starts.
+* A ${SETTLE}s idle period separates consecutive runs, and a shorter ${TEST_SETTLE}s one separates consecutive tests within a run, so that one job's writeback does not land inside the next job's first samples.
 * What each fio job measures, and the exact command it ran, is in [fio tests](#fio-tests) — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
 * \`seq_write_1m\`, \`seq_write_zero_1m\` and \`seq_write_rand_1m\` are the same job with different data in the buffer: whatever fio writes by default, all zeros, and fresh random bytes per block. On a backend that stores what it is given they are one number three times. Where they diverge, the backend is looking at the content — zeros compressing away, or identical blocks being deduplicated — and the write figures for real data are somewhere between the two extremes rather than at either.
 * If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
@@ -1555,10 +1655,27 @@ which is the only number here an application would recognise.
 
 A throwaway PostgreSQL ${PG_VERSION} cluster is created on each mount with
 \`initdb\`, loaded to scale ${PGBENCH_SCALE} (about $((PGBENCH_SCALE * 16)) MiB of table data before
-indexes), and then driven for ${PGBENCH_TIME}s through pgbench's built-in TPC-B-like
-workload at ${PGBENCH_CLIENTS} concurrent clients across ${PGBENCH_JOBS} threads. Each transaction is
-a handful of small updates and an insert, committed — so every one of them
-costs a WAL write and an \`fsync\` before the client is told it succeeded.
+indexes), warmed for ${PGBENCH_WARMUP}s and then driven for ${PGBENCH_TIME}s through pgbench's built-in
+TPC-B-like workload at ${PGBENCH_CLIENTS} concurrent clients across ${PGBENCH_JOBS} threads. Each
+transaction is a handful of small updates and an insert, committed — so every
+one of them costs a WAL write and an \`fsync\` before the client is told it
+succeeded.
+
+The warmup is discarded. Measured from cold a pgbench run does not report the
+workload, it reports the decay into it: the buffer cache starts empty, the WAL
+has not yet wrapped, and no checkpoint has happened, so the first seconds are
+faster than anything the storage can sustain. ${PGBENCH_WARMUP}s of unmeasured traffic puts
+the cluster in the state it would be in after a few minutes of real use, and
+the measured run then starts there. Its numbers are still in
+\`raw/<pass>/pgbench_<mount>.txt\` if you want to see how far off the cold start
+was. \`--no-vacuum\` on the measured run keeps that state rather than letting
+pgbench's usual pre-run vacuum undo it.
+
+Statements go over the wire as \`${PGBENCH_MODE}\` (\`PGBENCH_MODE\`). pgbench
+defaults to \`simple\`, which makes the server parse and plan every statement
+again on each execution — at which point a good part of what is being measured
+is postgres reading SQL rather than the storage underneath it. Real
+applications, and every connection pooler, use prepared statements.
 
 That commit path is why this tracks \`fsync_8k_qd1\` more closely than any other
 test here, and why the two can still disagree: postgres adds a WAL record, a
@@ -1570,9 +1687,12 @@ small writes but not with the burst a checkpoint delivers.
 
 The cluster runs with \`fsync\`, \`synchronous_commit\` and \`full_page_writes\` all
 on, which are the defaults, stated so that what was measured is on the record.
-\`shared_buffers\` is left at its 128 MB default on purpose: a cluster large
-enough to cache the working set would be reporting the speed of RAM. The
-cluster is deleted after each mount.
+\`max_wal_size\` is raised to ${PGBENCH_MAX_WAL} from the 1 GB default: at 1 GB a mount that
+absorbs writes quickly checkpoints every few seconds, which is a property of
+the default rather than of any tuned database, and it dominates the run.
+\`shared_buffers\` is left at its 128 MB default on purpose, in the other
+direction: a cluster large enough to cache the working set would be reporting
+the speed of RAM. The cluster is deleted after each mount.
 
 | Column | Meaning |
 | ------ | ------- |

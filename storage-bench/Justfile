@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r7"
+tag := "2026-08-24-r8"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -94,8 +94,9 @@ _run-against imageref +hostpaths:
     done
     # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
     # `RUNDIR=before-upgrade just run /mnt/ceph`.
-    for v in ORDER REPEATS SETTLE FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
-             PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME RUNDIR; do
+    for v in ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
+             PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME \
+             PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged
@@ -129,6 +130,10 @@ shell: load
 # rather than the default 100: the tmpfs is RAM, and 1.6 GB of it is not what a
 # smoke test should cost.
 #
+# PGBENCH_WARMUP is pinned to 2s rather than the default 30: the warmup is per
+# mount per pass, so the default would add three minutes to a check whose whole
+# point is being quick, and two seconds still exercises the code path.
+#
 # REPEATS=2 rather than the default 3, or 1: two passes is the cheapest number
 # that still exercises the per-pass directories and the aggregate charts, which
 # a single pass skips entirely and which are therefore exactly what a smoke test
@@ -145,6 +150,7 @@ smoke: load
         -e SETTLE=0 \
         -e FIO_SIZE=64M -e FIO_RUNTIME=2 -e REPEATS=3 \
         -e PGBENCH_SCALE=5 -e PGBENCH_CLIENTS=4 -e PGBENCH_JOBS=2 -e PGBENCH_TIME=5 \
+        -e PGBENCH_WARMUP=2 \
         {{ run_args }} \
         {{ image }}:{{ tag }} /data/a /data/b
     @ls -l {{ results }}/smoke
