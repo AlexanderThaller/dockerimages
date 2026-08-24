@@ -398,6 +398,28 @@ echo "Run order    : $ORDER"
 echo "Settle       : ${SETTLE}s between runs"
 echo "Results dir  : $OUTDIR"
 
+# The line in /proc/mounts for the filesystem a path is *on*: the longest mount
+# point that prefixes it, which is the same rule df applies.
+#
+# This used to be `grep -F "$mp" /proc/mounts`, which answers correctly when the
+# path under test is itself a mount point and answers nothing at all when it is
+# a directory inside one — so the report's mount section was silently empty for
+# `./storage-bench.sh /tank/backup/scratch`, and for every `--tmpfs`-backed
+# smoke run, without ever saying why.
+owning_mount() { # <path>
+  awk -v p="$1" '
+    {
+      m = $2
+      pre = (m == "/" ? "/" : m "/")
+      if ((m == p || index(p, pre) == 1) && length(m) > length(best_m)) {
+        best_m = m
+        best = $0
+      }
+    }
+    END { if (best != "") print best }
+  ' /proc/mounts
+}
+
 # Register the files we will create so cleanup can remove them.
 for mp in "${USABLE[@]}"; do
   CREATED+=("$mp/ddbench.zero" "$mp/ddbench.rand"
@@ -407,9 +429,10 @@ for mp in "${USABLE[@]}"; do
   # /proc/mounts rather than mount(8): the same device/fstype/options in the
   # same fstab columns, and it keeps util-linux out of the image entirely, which
   # was ~25 MB once its PAM and systemd links are counted. mount(8) is the
-  # fallback for a host that has no /proc.
+  # fallback for a host that has no /proc, and gets the old substring match
+  # because its output is not in the same columns.
   if [ -r /proc/mounts ]; then
-    grep -F "$mp" /proc/mounts >"$MOUNTINFO/mount_${sl}.txt" 2>&1
+    owning_mount "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
   elif command -v mount >/dev/null 2>&1; then
     mount | grep -F "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
   fi
