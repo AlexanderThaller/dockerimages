@@ -1478,6 +1478,19 @@ csv_table() { # <csvfile>
 HEADLINE_GRAPHS=""
 HEADLINE_SUFFIX=""
 HEADLINE_GRAPH_NOTE=""
+
+# Whether a pass actually produced charts. RUN_IDS has an entry for every pass
+# whether or not gnuplot ever ran, so its length cannot answer this: with PLOT=0
+# it is still one-per-pass, and taking the first entry as the headline on that
+# basis left the report with no charts and — because the "no charts, and here is
+# why" note is written only when there is no headline — nothing saying so.
+has_graphs() { # <pass id>
+  local f
+  for f in "$PLOTDIR/$1"/*.svg; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
 if [ "$REPEATS" -gt 1 ] && [ "$agg_graphed" = 1 ]; then
   HEADLINE_GRAPHS="aggregate"
   HEADLINE_SUFFIX=" (mean of $REPEATS passes)"
@@ -1489,7 +1502,7 @@ disagreed with itself. A band that stays narrow is a backend under control; one
 that flares is a backend whose behaviour depends on something not being
 measured here. The passes are also plotted separately in
 [pass by pass](#pass-by-pass)."
-elif [ ${#RUN_IDS[@]} -gt 0 ]; then
+elif [ ${#RUN_IDS[@]} -gt 0 ] && has_graphs "${RUN_IDS[0]}"; then
   HEADLINE_GRAPHS="${RUN_IDS[0]}"
 fi
 
