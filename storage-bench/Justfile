@@ -2,10 +2,16 @@
 #
 #   just                       build the image and load it into the engine
 #   just smoke                 prove the image works against a throwaway tmpfs
-#   just run /mnt/ceph /mnt/px benchmark those host paths
+#   just bench /tank/backup    benchmark a host path with the published image
+#   just run /mnt/ceph /mnt/px build the image first, then benchmark those paths
+#
+# `bench` is the one to reach for on the machine being measured: it pulls the
+# published image and needs nothing but a container engine. `run` rebuilds from
+# this checkout first, which needs Nix, and is what you want while changing the
+# script. Both put their reports in bench-results/ and are otherwise identical.
 #
 # Script tunables are read from the environment and forwarded into the
-# container, so `FIO_RUNTIME=60 ORDER=by-test just run /mnt/ceph` works.
+# container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
 tag := "2026-08-24-r2"
@@ -14,13 +20,18 @@ tag := "2026-08-24-r2"
 # line. `just push quay.io/someone` still overrides it for a one-off.
 default_registry := "docker.io/athallerde"
 
+# Where `just bench` pulls from. REGISTRY overrides it for a one-off, e.g.
+# `REGISTRY=quay.io/someone just bench /tank/backup`.
+registry := env("REGISTRY", default_registry)
+
 # docker or podman; override with CONTAINER_ENGINE=podman
 engine := env("CONTAINER_ENGINE", "docker")
 
 # Extra flags for `run`/`smoke`, e.g. RUN_ARGS="--cpus 4 --network none"
 run_args := env("RUN_ARGS", "")
 
-# Where `just run` drops its reports on the host.
+# Where `just bench` and `just run` drop their reports on the host, one
+# timestamped directory per run.
 results := justfile_directory() / "bench-results"
 
 _default: help
@@ -37,11 +48,31 @@ build:
 load: build
     {{ engine }} load < result
 
+# Needs only a container engine — no Nix, no checkout of anything but this
+# Justfile — which is what makes it the one to run on the storage host itself:
+#
+#   just bench /tank/backup
+#   just bench /tank/backup /mnt/ceph        # head-to-head
+#   PGBENCH=0 just bench /tank/backup        # skip the postgres workload
+#
+# Pulled every time so a stale local copy of the tag cannot silently be what
+# gets measured.
+
+# Benchmark host paths using the published image (no build, no Nix).
+bench +hostpaths:
+    {{ engine }} pull {{ registry }}/{{ image }}:{{ tag }}
+    @just _run-against {{ registry }}/{{ image }}:{{ tag }} {{ hostpaths }}
+
 # Each host path is bind-mounted at /data/<basename> and handed to the script in
 # that order, so `just run /mnt/ceph /mnt/portworx` benchmarks both.
 
-# Run the benchmark suite against one or more host paths.
+# Build the image from this checkout, then benchmark host paths with it.
 run +hostpaths: load
+    @just _run-against {{ image }}:{{ tag }} {{ hostpaths }}
+
+# The body shared by `bench` and `run`; they differ only in where the image
+# came from.
+_run-against imageref +hostpaths:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p {{ results }}
@@ -49,6 +80,15 @@ run +hostpaths: load
     for p in {{ hostpaths }}; do
         [ -d "$p" ] || { echo "not a directory: $p" >&2; exit 1; }
         name="$(basename "$p")"
+        # Two paths with the same basename would mount over each other at
+        # /data/<name>, and the run would quietly benchmark one of them twice
+        # rather than comparing the two.
+        for t in "${targets[@]:-}"; do
+            [ "$t" = "/data/$name" ] && {
+                echo "two paths share the basename '$name' — mount one elsewhere" >&2
+                exit 1
+            }
+        done
         vols+=(-v "$(realpath "$p"):/data/$name")
         targets+=("/data/$name")
     done
@@ -75,7 +115,7 @@ run +hostpaths: load
         --shm-size=256m \
         -v {{ results }}:/out -e OUTBASE=/out \
         "${vols[@]}" "${envs[@]}" {{ run_args }} \
-        {{ image }}:{{ tag }} "${targets[@]}"
+        {{ imageref }} "${targets[@]}"
     echo "Reports in {{ results }}/ (one directory per run)"
 
 # Interactive shell in the image.
