@@ -8,7 +8,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just run /mnt/ceph` works.
 
 image := "storage-bench"
-tag := "2026-08-20-r5"
+tag := "2026-08-24-r1"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -54,7 +54,7 @@ run +hostpaths: load
     done
     # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
     # `RUNDIR=before-upgrade just run /mnt/ceph`.
-    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE RUNDIR; do
+    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged

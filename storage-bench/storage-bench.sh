@@ -38,7 +38,7 @@
 #   FIO_SIZE      fio working set per job       (default 2G)
 #   FIO_RUNTIME   seconds per fio job           (default 30)
 #   IOENGINE      fio ioengine                  (default libaio)
-#   LOG_AVG_MSEC  fio time-series sample window (default 500)
+#   LOG_AVG_MSEC  fio time-series sample window (default 100)
 #   PLOT          1|0, draw the gnuplot graphs  (default 1)
 #   RENDER        html|none                     (default html)
 #
@@ -70,7 +70,7 @@ DD_RAND_MB="${DD_RAND_MB:-10240}"
 FIO_SIZE="${FIO_SIZE:-10G}"
 FIO_RUNTIME="${FIO_RUNTIME:-60}"
 IOENGINE="${IOENGINE:-libaio}"
-LOG_AVG_MSEC="${LOG_AVG_MSEC:-500}"
+LOG_AVG_MSEC="${LOG_AVG_MSEC:-100}"
 PLOT="${PLOT:-1}"
 RENDER="${RENDER:-html}"
 
@@ -84,6 +84,16 @@ esac
 
 # The sample window doubles as the bucket width when the per-job samples are
 # folded together, so it has to be a positive integer.
+#
+# 100ms is a floor worth thinking before going under. Two things break down as
+# the window shrinks. fio averages whatever I/Os completed inside it, so on
+# slow storage a short window holds only a handful of them and the line becomes
+# a hash of quantisation steps rather than a measurement — at 200 IOPS a 20ms
+# window sees four I/Os. And concurrent jobs timestamp their samples a
+# millisecond or two apart, which fio_series absorbs by rounding onto the
+# nearest window boundary; that has margin at 100ms and very little at 10ms,
+# and a sample landing in the wrong bucket shows up as a sawtooth, because
+# throughput is summed across jobs.
 case "$LOG_AVG_MSEC" in
 '' | *[!0-9]*)
   echo "LOG_AVG_MSEC must be a positive integer (got '$LOG_AVG_MSEC')" >&2
@@ -588,6 +598,15 @@ plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <
     printf '%s' "${parts[*]}"
   )"
 
+  # The legend sits below the plot, one entry per row, and the canvas grows to
+  # make room for the rows. It used to sit outside right, which gnuplot sizes by
+  # reserving space for the widest label — and the labels are mount paths. A
+  # short one costs nothing, but a PVC mounted somewhere deep took the plot from
+  # 917px of the 1100px canvas down to 245px, which is a tenth of the resolution
+  # for the same number of samples. Below the plot, the label length stops
+  # mattering: the same graph keeps ~1078px whatever the mounts are called.
+  local height=$((420 + 24 * ${#parts[@]}))
+
   # Everything emitted below is deliberately ASCII: the script runs under
   # LC_ALL=C, where gnuplot's iconv cannot convert its own non-ASCII glyphs and
   # warns once per plot.
@@ -604,13 +623,13 @@ plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <
     # text would render as subscripts. An explicit white background, because
     # the SVG terminal otherwise leaves it transparent and the black axis text
     # then disappears against a dark-mode page.
-    echo "set terminal svg noenhanced size 1100,420 font 'sans-serif,10' background rgb 'white'"
+    echo "set terminal svg noenhanced size 1100,$height font 'sans-serif,10' background rgb 'white'"
     echo "set output '$img'"
     echo "set title '$desc - $test'"
     echo "set xlabel 'elapsed within the fio run (s)'"
     echo "set ylabel '$ylabel'"
     echo "set grid xtics ytics lc rgb '#c8c8c8'"
-    echo "set key outside right top"
+    echo "set key below maxcols 1"
     echo "set xrange [0:*]"
     if [ "$logscale" = 1 ]; then
       echo "set logscale y"
