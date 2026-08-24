@@ -25,6 +25,17 @@
 # In both modes tests always execute in the same order within a mount, so
 # writes still precede the reads that depend on them.
 #
+# REPEATS runs the whole suite that many times over, rather than repeating each
+# test in place. One pass is one sample of the storage as a whole, so a slow
+# drift — a cache warming, a scrub starting, a neighbour waking up — moves a
+# whole pass rather than hiding inside one test's repeats. It also keeps every
+# pass ordered identically, which repeating in place would not.
+#
+# Each pass writes its own results, and the graphs are produced twice over: once
+# per pass, and once aggregated across passes as a mean with the spread drawn
+# behind it. With one pass, which is the default, there is nothing to aggregate
+# and the output is exactly what it always was.
+#
 # Tunables (env vars):
 #   OUTBASE       directory the run dir goes in (default /tmp)
 #   RUNDIR        this run's directory inside it
@@ -32,6 +43,7 @@
 #                                                set it empty to write straight
 #                                                into OUTBASE)
 #   ORDER         by-mount | by-test            (default by-mount)
+#   REPEATS       times to run the whole suite  (default 1)
 #   SETTLE        seconds to idle between runs  (default 15)
 #   DD_ZERO_MB    size of the dd zero write     (default 1024)
 #   DD_RAND_MB    size of the dd urandom write  (default 256)
@@ -77,6 +89,7 @@ OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
 RUNDIR="${RUNDIR-bench-results-$TS}"
 OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
+REPEATS="${REPEATS:-1}"
 SETTLE="${SETTLE:-15}"
 DD_ZERO_MB="${DD_ZERO_MB:-10240}"
 DD_RAND_MB="${DD_RAND_MB:-10240}"
@@ -143,7 +156,7 @@ esac
 
 # Checked up front rather than left to pgbench, which would otherwise fail an
 # hour into the run, after dd and fio have already been paid for.
-for v in PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME; do
+for v in REPEATS PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME; do
   case "${!v}" in
   '' | *[!0-9]*)
     echo "$v must be a positive integer (got '${!v}')" >&2
@@ -167,12 +180,39 @@ DD_CSV="$OUTDIR/dd_results.csv"
 FIO_CSV="$OUTDIR/fio_results.csv"
 PG_CSV="$OUTDIR/pgbench_results.csv"
 MD="$OUTDIR/storage-benchmark-report.md"
-RAWDIR="$OUTDIR/raw"
-LOGDIR="$OUTDIR/fio-logs" # fio's own time-series logs, one set per test
-PLOTDIR="$OUTDIR/graphs"  # the SVGs the report embeds
-PLOTDATA="$PLOTDIR/data"  # per-series gnuplot input, kept for re-plotting
+PLOTDIR="$OUTDIR/graphs" # the SVGs the report embeds
 
-mkdir -p "$RAWDIR" "$LOGDIR" "$PLOTDATA" || {
+# Anything a pass produces is written under its own directory, because a second
+# pass would otherwise overwrite the first: fio names its logs after the test,
+# not after the attempt. RAWDIR, LOGDIR and PLOTDATA are repointed at the
+# current pass by set_run_paths; the run_* functions read them as globals and
+# do not need to know how many passes there are.
+#
+# Run ids are zero-padded so that graphs/ and raw/ sort in execution order in a
+# file browser rather than putting run-10 next to run-1.
+RUN_ID=""
+RAWDIR=""
+LOGDIR=""
+PLOTDATA=""
+
+run_id_for() { printf 'run-%02d' "$1"; }
+
+set_run_paths() { # <pass number>
+  RUN_ID="$(run_id_for "$1")"
+  RAWDIR="$OUTDIR/raw/$RUN_ID"
+  LOGDIR="$OUTDIR/fio-logs/$RUN_ID"
+  PLOTDATA="$PLOTDIR/data/$RUN_ID"
+  mkdir -p "$RAWDIR" "$LOGDIR" "$PLOTDATA" || {
+    echo "cannot create $OUTDIR/$RUN_ID" >&2
+    exit 1
+  }
+}
+
+# df and /proc/mounts are properties of the mount rather than of a pass, so they
+# are captured once and live above the per-pass directories.
+MOUNTINFO="$OUTDIR/raw"
+
+mkdir -p "$MOUNTINFO" "$PLOTDIR" || {
   echo "cannot create $OUTDIR" >&2
   exit 1
 }
@@ -358,22 +398,22 @@ for mp in "${USABLE[@]}"; do
   CREATED+=("$mp/ddbench.zero" "$mp/ddbench.rand"
     "$mp/fio_seq.dat" "$mp/fio_rand.dat" "$mp/fio_mix.dat" "$mp/fio_sync.dat")
   sl="$(slug "$mp")"
-  df -h "$mp" >"$RAWDIR/df_${sl}.txt" 2>&1
+  df -h "$mp" >"$MOUNTINFO/df_${sl}.txt" 2>&1
   # /proc/mounts rather than mount(8): the same device/fstype/options in the
   # same fstab columns, and it keeps util-linux out of the image entirely, which
   # was ~25 MB once its PAM and systemd links are counted. mount(8) is the
   # fallback for a host that has no /proc.
   if [ -r /proc/mounts ]; then
-    grep -F "$mp" /proc/mounts >"$RAWDIR/mount_${sl}.txt" 2>&1
+    grep -F "$mp" /proc/mounts >"$MOUNTINFO/mount_${sl}.txt" 2>&1
   elif command -v mount >/dev/null 2>&1; then
-    mount | grep -F "$mp" >"$RAWDIR/mount_${sl}.txt" 2>&1
+    mount | grep -F "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
   fi
 done
 
-echo "mount,test,size_mb,throughput,elapsed_s" >"$DD_CSV"
-echo "mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
+echo "run,mount,test,size_mb,throughput,elapsed_s" >"$DD_CSV"
+echo "run,mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
 [ "$have_pgbench" = 1 ] &&
-  echo "mount,scale,clients,threads,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
+  echo "run,mount,scale,clients,threads,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
 
 # ---------------------------------------------------------------------------
 # dd helpers
@@ -405,13 +445,13 @@ run_dd() {
 
   if [ $rc -ne 0 ]; then
     info "  FAILED (see $raw)"
-    echo "$mp,$name,$size_mb,FAILED,FAILED" >>"$DD_CSV"
+    echo "$RUN_ID,$mp,$name,$size_mb,FAILED,FAILED" >>"$DD_CSV"
     return 1
   fi
 
   parse_dd "$out"
   info "  $DD_SPEED  (${DD_ELAPSED}s)"
-  echo "$mp,$name,$size_mb,$DD_SPEED,$DD_ELAPSED" >>"$DD_CSV"
+  echo "$RUN_ID,$mp,$name,$size_mb,$DD_SPEED,$DD_ELAPSED" >>"$DD_CSV"
 }
 
 # ---------------------------------------------------------------------------
@@ -456,13 +496,13 @@ run_fio() {
 
   if [ $rc -ne 0 ] || [ -z "$line" ]; then
     info "  FAILED (see $raw)"
-    echo "$mp,$name,FAILED,FAILED,FAILED,FAILED,FAILED,FAILED" >>"$FIO_CSV"
+    echo "$RUN_ID,$mp,$name,FAILED,FAILED,FAILED,FAILED,FAILED,FAILED" >>"$FIO_CSV"
     return 1
   fi
 
   row="$(printf '%s\n' "$line" | awk -F';' -v OFS=, '{print $8, $7, $16, $49, $48, $57}')"
   info "  read: $(echo "$row" | cut -d, -f1) IOPS / write: $(echo "$row" | cut -d, -f4) IOPS"
-  echo "$mp,$name,$row" >>"$FIO_CSV"
+  echo "$RUN_ID,$mp,$name,$row" >>"$FIO_CSV"
 }
 
 # ---------------------------------------------------------------------------
@@ -504,7 +544,7 @@ run_pgbench() { # <mount>
   prefix="$LOGDIR/pgbench_${sl}"
   raw="$RAWDIR/pgbench_${sl}.txt"
 
-  local failrow="$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,FAILED,FAILED,FAILED,FAILED,FAILED"
+  local failrow="$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,FAILED,FAILED,FAILED,FAILED,FAILED"
 
   # A cluster left behind by an earlier run would mean measuring a load that
   # never happened, so each run starts from initdb.
@@ -591,7 +631,7 @@ run_pgbench() { # <mount>
   [ -z "$failed" ] && failed=0
 
   info "  $tps tps, ${lat}ms mean latency"
-  echo "$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,$init_s,$tps,$lat,$txns,$failed" >>"$PG_CSV"
+  echo "$RUN_ID,$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,$init_s,$tps,$lat,$txns,$failed" >>"$PG_CSV"
 
   # The cluster is ~16 MiB per scale point and the next mount wants the space.
   rm -rf "$pgdata"
@@ -698,31 +738,46 @@ run_test() {
 # ---------------------------------------------------------------------------
 START_EPOCH=$(date +%s)
 
-if [ "$ORDER" = "by-mount" ]; then
-  first_mount=1
-  for mp in "${USABLE[@]}"; do
-    [ $first_mount -eq 0 ] && {
-      log "cooldown between mounts"
-      settle
-    }
-    first_mount=0
-    log "$mp"
-    for t in "${TESTS[@]}"; do
-      run_test "$mp" "$t"
-    done
-  done
-else
-  first_unit=1
-  for t in "${TESTS[@]}"; do
-    log "$t"
+RUN_IDS=()
+
+for pass in $(seq 1 "$REPEATS"); do
+  set_run_paths "$pass"
+  RUN_IDS+=("$RUN_ID")
+
+  if [ "$REPEATS" -gt 1 ]; then
+    log "pass $pass of $REPEATS ($RUN_ID)"
+    # The same cooldown that separates runs within a pass separates the passes
+    # themselves, so pass 2 does not start measuring while the backend is still
+    # flushing what pass 1 wrote.
+    [ "$pass" -gt 1 ] && settle
+  fi
+
+  if [ "$ORDER" = "by-mount" ]; then
+    first_mount=1
     for mp in "${USABLE[@]}"; do
-      [ $first_unit -eq 0 ] && settle
-      first_unit=0
-      info "-> $mp"
-      run_test "$mp" "$t"
+      [ $first_mount -eq 0 ] && {
+        log "cooldown between mounts"
+        settle
+      }
+      first_mount=0
+      log "$mp"
+      for t in "${TESTS[@]}"; do
+        run_test "$mp" "$t"
+      done
     done
-  done
-fi
+  else
+    first_unit=1
+    for t in "${TESTS[@]}"; do
+      log "$t"
+      for mp in "${USABLE[@]}"; do
+        [ $first_unit -eq 0 ] && settle
+        first_unit=0
+        info "-> $mp"
+        run_test "$mp" "$t"
+      done
+    done
+  fi
+done
 
 ELAPSED=$(($(date +%s) - START_EPOCH))
 
@@ -902,7 +957,19 @@ render_plot() { # <img> <gp> <title> <xlabel> <ylabel> <logscale> <part>...
   # 917px of the 1100px canvas down to 245px, which is a tenth of the resolution
   # for the same number of samples. Below the plot, the label length stops
   # mattering: the same graph keeps ~1078px whatever the mounts are called.
-  local height=$((420 + 24 * ${#parts[@]}))
+  #
+  # Only the parts that will appear in the legend earn a row. The aggregate
+  # plots draw a spread band behind each mean line, and those bands are
+  # `notitle` — counting them would leave a strip of empty canvas under every
+  # aggregate chart.
+  local legend=0 p
+  for p in "${parts[@]}"; do
+    case "$p" in
+    *notitle*) ;;
+    *) legend=$((legend + 1)) ;;
+    esac
+  done
+  local height=$((420 + 24 * legend))
 
   # Everything emitted below is deliberately ASCII: the script runs under
   # LC_ALL=C, where gnuplot's iconv cannot convert its own non-ASCII glyphs and
@@ -943,90 +1010,199 @@ render_plot() { # <img> <gp> <title> <xlabel> <ylabel> <logscale> <part>...
   [ $rc -eq 0 ] && [ -s "$img" ]
 }
 
+# Fold the same series from every pass into one "time mean min max" file. The
+# passes share a time base — each series is already rebased onto the start of
+# its own run — so the buckets line up and can simply be averaged across files.
+#
+# A bucket at the very end may exist in only some passes, if one run produced a
+# sample a fraction of a window later than the others. Averaging over however
+# many passes actually reached that bucket is the honest answer; the band there
+# collapses onto the line, which is the correct picture of a single sample.
+aggregate_series() { # <dat>...
+  awk '
+    {
+      s[$1] += $2
+      n[$1]++
+      if (!($1 in mn) || $2 < mn[$1]) mn[$1] = $2
+      if (!($1 in mx) || $2 > mx[$1]) mx[$1] = $2
+    }
+    END {
+      for (t in s) printf "%.3f %.6f %.6f %.6f\n", t, s[t] / n[t], mn[t], mx[t]
+    }' "$@" | sort -n
+}
+
+# gnuplot picks its own colours per plot element, which is fine when every
+# element is a line. The aggregates pair a band with a line and the two have to
+# match, so the colour is stated instead. These are gnuplot's own defaults,
+# which are already chosen to stay distinguishable.
+PLOT_COLORS=('#9400d3' '#009e73' '#56b4e9' '#e69f00' '#f0e442' '#0072b2' '#e51e10' '#000000')
+
+# The gnuplot elements for one series, returned in a global because they are
+# full of spaces and quotes and would not survive command substitution.
+#
+# A per-pass chart is one line. An aggregate is the min-max band across passes,
+# shaded, with the mean drawn over it — both in the same colour, so the pair
+# reads as one series rather than two. A wide band means the storage did not
+# do the same thing twice, which is the reason for running it more than once.
+PLOT_PARTS=()
+plot_parts() { # <datfile> <title> <pass id> <colour index>
+  local dat="$1" title="$2" rid="$3" ci="$4"
+  local color="${PLOT_COLORS[$((ci % ${#PLOT_COLORS[@]}))]}"
+  PLOT_PARTS=()
+  if [ "$rid" = agg ]; then
+    PLOT_PARTS+=("'$dat' using 1:3:4 with filledcurves fc rgb '$color' fs transparent solid 0.18 notitle")
+    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 lc rgb '$color' title '$title'")
+  else
+    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 title '$title'")
+  fi
+}
+
 # One SVG for one (test, metric), overlaying every mount and direction that
 # produced samples. Returns non-zero if there was nothing to draw.
-plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <logscale>
-  local test="$1" suffix="$2" key="$3" mode="$4" scale="$5"
-  local ylabel="$6" desc="$7" logscale="$8"
-  local parts=() mp sl d dat title
+#
+# With `agg` as the pass id it plots the mean across passes with the min-max
+# spread shaded behind it, reading the per-pass .dat files that the earlier
+# calls left behind; otherwise it plots that one pass.
+plot_metric() { # <pass id> <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <logscale>
+  local rid="$1" test="$2" suffix="$3" key="$4" mode="$5" scale="$6"
+  local ylabel="$7" desc="$8" logscale="$9"
+  local parts=() mp sl d dat title ci=0 srcs outdir logdir datdir
+
+  # Derived from the pass being drawn, not read from the LOGDIR/PLOTDATA
+  # globals: by the time the graphs are drawn those still point at whichever
+  # pass ran last, so every pass would silently be plotted from the last one's
+  # logs and the aggregate would average one pass with itself.
+  if [ "$rid" = agg ]; then outdir="$PLOTDIR/aggregate"; else outdir="$PLOTDIR/$rid"; fi
+  logdir="$OUTDIR/fio-logs/$rid"
+  datdir="$PLOTDIR/data/$rid"
+  mkdir -p "$outdir" "$datdir"
 
   for mp in "${USABLE[@]}"; do
     sl="$(slug "$mp")"
     for d in 0 1; do
-      dat="$PLOTDATA/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat"
-      # logscale doubles as the drop-non-positive flag: a zero is a real datum
-      # on a throughput plot (the backend stalled) and must stay, but it has no
-      # place on a log axis, where gnuplot would silently drop it anyway.
-      fio_series "$LOGDIR/${sl}_${test}${suffix}" "$d" "$mode" "$scale" "$logscale" >"$dat"
+      title="${DDIR_NAME[$d]}"
+      [ ${#USABLE[@]} -gt 1 ] && title="$mp ${DDIR_NAME[$d]}"
+
+      if [ "$rid" = agg ]; then
+        srcs=()
+        for r in "${RUN_IDS[@]}"; do
+          [ -s "$PLOTDIR/data/$r/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat" ] &&
+            srcs+=("$PLOTDIR/data/$r/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat")
+        done
+        [ ${#srcs[@]} -eq 0 ] && continue
+        dat="$PLOTDIR/data/aggregate_${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat"
+        aggregate_series "${srcs[@]}" >"$dat"
+      else
+        dat="$datdir/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat"
+        # logscale doubles as the drop-non-positive flag: a zero is a real datum
+        # on a throughput plot (the backend stalled) and must stay, but it has no
+        # place on a log axis, where gnuplot would silently drop it anyway.
+        fio_series "$logdir/${sl}_${test}${suffix}" "$d" "$mode" "$scale" "$logscale" >"$dat"
+      fi
+
       if [ ! -s "$dat" ]; then
         rm -f "$dat"
         continue
       fi
-      if [ ${#USABLE[@]} -gt 1 ]; then
-        title="$mp ${DDIR_NAME[$d]}"
-      else
-        title="${DDIR_NAME[$d]}"
-      fi
-      parts+=("'$dat' using 1:2 with lines lw 2 title '$title'")
+      plot_parts "$dat" "$title" "$rid" "$ci"
+      parts+=("${PLOT_PARTS[@]}")
+      ci=$((ci + 1))
     done
   done
 
-  render_plot "$PLOTDIR/${test}_${key}.svg" "$PLOTDIR/${test}_${key}.gp" \
+  render_plot "$outdir/${test}_${key}.svg" "$outdir/${test}_${key}.gp" \
     "$desc - $test" "elapsed within the fio run (s)" "$ylabel" "$logscale" \
     "${parts[@]}"
 }
 
 # The pgbench counterpart: one metric, every mount on the same axes. There is
 # no read/write split here — a TPC-B transaction is both.
-plot_pgbench() { # <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
-  local key="$1" mode="$2" ylabel="$3" desc="$4" logscale="$5"
-  local parts=() mp sl dat title
+plot_pgbench() { # <pass id> <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
+  local rid="$1" key="$2" mode="$3" ylabel="$4" desc="$5" logscale="$6"
+  local parts=() mp sl dat title ci=0 srcs outdir logdir datdir
+
+  # Same reason as plot_metric: the pass being drawn, not whichever ran last.
+  if [ "$rid" = agg ]; then outdir="$PLOTDIR/aggregate"; else outdir="$PLOTDIR/$rid"; fi
+  logdir="$OUTDIR/fio-logs/$rid"
+  datdir="$PLOTDIR/data/$rid"
+  mkdir -p "$outdir" "$datdir"
 
   for mp in "${USABLE[@]}"; do
     sl="$(slug "$mp")"
-    dat="$PLOTDATA/${sl}_pgbench_${key}.dat"
-    pgbench_series "$LOGDIR/pgbench_${sl}" "$mode" >"$dat"
+    title="pgbench"
+    [ ${#USABLE[@]} -gt 1 ] && title="$mp"
+
+    if [ "$rid" = agg ]; then
+      srcs=()
+      for r in "${RUN_IDS[@]}"; do
+        [ -s "$PLOTDIR/data/$r/${sl}_pgbench_${key}.dat" ] &&
+          srcs+=("$PLOTDIR/data/$r/${sl}_pgbench_${key}.dat")
+      done
+      [ ${#srcs[@]} -eq 0 ] && continue
+      dat="$PLOTDIR/data/aggregate_${sl}_pgbench_${key}.dat"
+      aggregate_series "${srcs[@]}" >"$dat"
+    else
+      dat="$datdir/${sl}_pgbench_${key}.dat"
+      pgbench_series "$logdir/pgbench_${sl}" "$mode" >"$dat"
+    fi
+
     if [ ! -s "$dat" ]; then
       rm -f "$dat"
       continue
     fi
-    if [ ${#USABLE[@]} -gt 1 ]; then title="$mp"; else title="pgbench"; fi
-    parts+=("'$dat' using 1:2 with lines lw 2 title '$title'")
+    plot_parts "$dat" "$title" "$rid" "$ci"
+    parts+=("${PLOT_PARTS[@]}")
+    ci=$((ci + 1))
   done
 
-  render_plot "$PLOTDIR/pgbench_${key}.svg" "$PLOTDIR/pgbench_${key}.gp" \
+  render_plot "$outdir/pgbench_${key}.svg" "$outdir/pgbench_${key}.gp" \
     "$desc - pgbench" "elapsed within the pgbench run (s)" "$ylabel" "$logscale" \
     "${parts[@]}"
 }
 
 pgbench_graphed=0
+agg_graphed=0
 
 if [ "$have_gnuplot" = 1 ]; then
   log "Drawing graphs"
-  for t in "${FIO_TESTS[@]}"; do
-    drawn=0
-    # bandwidth is logged in KiB/s; 1/1024 puts it in MiB/s.
-    # clat is logged in nanoseconds; 1/1000 puts it in microseconds.
-    plot_metric "$t" _iops.log iops sum 1 "IOPS" "IOPS over time" 0 && drawn=1
-    plot_metric "$t" _bw.log bw sum 0.0009765625 "bandwidth (MiB/s)" \
-      "Bandwidth over time" 0 && drawn=1
-    plot_metric "$t" _clat.log clat avg 0.001 "completion latency (us)" \
-      "Completion latency over time" 1 && drawn=1
-    if [ $drawn -eq 1 ]; then info "$t"; else info "$t — no samples, skipped"; fi
-  done
 
-  if [ "$have_pgbench" = 1 ]; then
+  # Per pass first, then the aggregate, which reads the per-pass data files the
+  # first loop wrote. With REPEATS=1 the aggregate would be the same chart drawn
+  # a second time, so it is skipped.
+  passes=("${RUN_IDS[@]}")
+  [ "$REPEATS" -gt 1 ] && passes+=(agg)
+
+  for rid in "${passes[@]}"; do
+    [ "$REPEATS" -gt 1 ] && {
+      if [ "$rid" = agg ]; then info "aggregate:"; else info "$rid:"; fi
+    }
+    for t in "${FIO_TESTS[@]}"; do
+      drawn=0
+      # bandwidth is logged in KiB/s; 1/1024 puts it in MiB/s.
+      # clat is logged in nanoseconds; 1/1000 puts it in microseconds.
+      plot_metric "$rid" "$t" _iops.log iops sum 1 "IOPS" "IOPS over time" 0 && drawn=1
+      plot_metric "$rid" "$t" _bw.log bw sum 0.0009765625 "bandwidth (MiB/s)" \
+        "Bandwidth over time" 0 && drawn=1
+      plot_metric "$rid" "$t" _clat.log clat avg 0.001 "completion latency (us)" \
+        "Completion latency over time" 1 && drawn=1
+      if [ $drawn -eq 1 ]; then info "  $t"; else info "  $t — no samples, skipped"; fi
+      [ "$rid" = agg ] && [ $drawn -eq 1 ] && agg_graphed=1
+    done
+
+    [ "$have_pgbench" = 1 ] || continue
     drawn=0
-    plot_pgbench tps tps "transactions/s" "Transaction rate over time" 0 && drawn=1
-    plot_pgbench lat lat "mean latency (ms)" "Mean transaction latency over time" 1 && drawn=1
+    plot_pgbench "$rid" tps tps "transactions/s" "Transaction rate over time" 0 && drawn=1
+    plot_pgbench "$rid" lat lat "mean latency (ms)" \
+      "Mean transaction latency over time" 1 && drawn=1
     # Worst case rather than mean, because the mean hides exactly what storage
     # does to a database: a checkpoint or an fsync stall shows up as one
     # interval where the slowest transaction took a hundred times the average.
-    plot_pgbench maxlat maxlat "worst latency (ms)" \
+    plot_pgbench "$rid" maxlat maxlat "worst latency (ms)" \
       "Worst transaction latency over time" 1 && drawn=1
-    pgbench_graphed=$drawn
-    if [ $drawn -eq 1 ]; then info "pgbench"; else info "pgbench — no samples, skipped"; fi
-  fi
+    [ $drawn -eq 1 ] && pgbench_graphed=1
+    [ "$rid" = agg ] && [ $drawn -eq 1 ] && agg_graphed=1
+    if [ $drawn -eq 1 ]; then info "  pgbench"; else info "  pgbench — no samples, skipped"; fi
+  done
 fi
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +1245,50 @@ csv_table() { # <csvfile>
   ' "$1"
 }
 
+# Which set of charts belongs next to the prose. With more than one pass that
+# is the aggregate — the mean is the summary you want beside the explanation,
+# and the individual passes are detail that goes at the end. With one pass there
+# is no aggregate and the one pass is itself the headline.
+HEADLINE_GRAPHS=""
+HEADLINE_SUFFIX=""
+HEADLINE_GRAPH_NOTE=""
+if [ "$REPEATS" -gt 1 ] && [ "$agg_graphed" = 1 ]; then
+  HEADLINE_GRAPHS="aggregate"
+  HEADLINE_SUFFIX=" (mean of $REPEATS passes)"
+  HEADLINE_GRAPH_NOTE="
+The suite ran ${REPEATS} times. Each chart below is the mean across those passes,
+with the band behind it spanning the slowest and fastest pass at that moment —
+so the line is what to expect and the width of the band is how much the storage
+disagreed with itself. A band that stays narrow is a backend under control; one
+that flares is a backend whose behaviour depends on something not being
+measured here. The passes are also plotted separately in
+[pass by pass](#pass-by-pass)."
+elif [ ${#RUN_IDS[@]} -gt 0 ]; then
+  HEADLINE_GRAPHS="${RUN_IDS[0]}"
+fi
+
+# The three charts for one test, if they were drawn. The alt text doubles as the
+# caption: render_html lifts a paragraph that holds nothing but an image into a
+# <figure> and reuses it as the <figcaption>, which is as close as Markdown gets
+# to AsciiDoc's `.Title`.
+emit_graphs() { # <graph basename> <caption subject> [pass id]
+  local base="$1" subject="$2" rid="${3:-$HEADLINE_GRAPHS}" suffix key cap spec
+  [ -n "$rid" ] || return 0
+  if [ "$rid" = "$HEADLINE_GRAPHS" ]; then suffix="$HEADLINE_SUFFIX"; else suffix=" ($rid)"; fi
+
+  local specs=("iops:IOPS" "bw:Bandwidth" "clat:Completion latency")
+  [ "$base" = pgbench ] &&
+    specs=("tps:Transaction rate" "lat:Mean latency" "maxlat:Worst latency")
+
+  for spec in "${specs[@]}"; do
+    key="${spec%%:*}"
+    cap="${spec#*:}"
+    [ -f "$PLOTDIR/$rid/${base}_${key}.svg" ] || continue
+    echo "![${cap} — ${subject}${suffix}](graphs/${rid}/${base}_${key}.svg)"
+    echo
+  done
+}
+
 log "Writing report"
 
 {
@@ -1092,6 +1312,7 @@ log "Writing report"
 | Parameter | Value |
 | --------- | ----- |
 | Run order             | ${ORDER} |
+| Passes over the suite | ${REPEATS} |
 | Settle between runs   | ${SETTLE}s |
 | dd zero write size    | ${DD_ZERO_MB} MiB |
 | dd urandom write size | ${DD_RAND_MB} MiB |
@@ -1111,7 +1332,7 @@ log "Writing report"
 * If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
 * dd and fio measure the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
-* The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. That is what the [time series](#over-time) section is for.
+* The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. The time-series chart under each test in [fio tests](#fio-tests) is where that shows.
 
 ## Mount points
 
@@ -1122,9 +1343,9 @@ EOF
     echo "### $mp"
     echo
     echo '```text'
-    cat "$RAWDIR/df_${sl}.txt" 2>/dev/null
+    cat "$MOUNTINFO/df_${sl}.txt" 2>/dev/null
     echo
-    cat "$RAWDIR/mount_${sl}.txt" 2>/dev/null
+    cat "$MOUNTINFO/mount_${sl}.txt" 2>/dev/null
     echo '```'
     echo
   done
@@ -1163,8 +1384,24 @@ comparable:
 * \`--directory\` — the mount under test. It is the only flag that differs between
   mounts — everything below is identical for all of them.
 
-The command shown under each test is the one that ran, recorded as it ran.
+The command shown under each test is the one that ran, recorded as it ran, and
+below it is what the storage did while it ran.
 
+Every fio job logs itself as a time series, one sample per ${LOG_AVG_MSEC}ms window, and
+that is what those charts are. The x axis is elapsed time **within that job**,
+so runs on different mounts line up even when they were minutes apart on the
+clock. Where a job does both reads and writes (\`rand_rw_70_30_4k\`) each
+direction is a separate line. Multi-job tests have their per-job samples summed
+for IOPS and bandwidth and averaged for latency, so the lines are the aggregate
+the tables report, not one worker's share of it. Latency uses a logarithmic y
+axis — storage latency spans orders of magnitude and a linear axis flattens
+everything below the worst spike into the baseline.
+
+What to look for: a flat line is a backend holding its service level; a decaying
+curve is usually a cache or write buffer filling; periodic collapses to near
+zero are flush or compaction stalls, which the whole-run averages in the table
+below will not show you at all.
+${HEADLINE_GRAPH_NOTE}
 EOF
 
   for t in "${FIO_TESTS[@]}"; do
@@ -1178,6 +1415,7 @@ EOF
       echo '```'
       echo
     fi
+    emit_graphs "$t" "$t"
   done
 
   cat <<'MDEOF'
@@ -1228,6 +1466,20 @@ cluster is deleted after each mount.
 
 EOF
     csv_table "$PG_CSV"
+
+    if [ "$pgbench_graphed" = 1 ]; then
+      cat <<'EOF'
+
+pgbench aggregates its own log into fixed intervals and one second is the
+finest it will accept, so these are coarser than the fio charts above — a stall
+shorter than a second is inside a sample rather than visible as one. The worst
+latency chart is the one to read for that: it plots the slowest single
+transaction in each interval, so a checkpoint or an fsync stall that the mean
+absorbs still shows as a spike.
+
+EOF
+      emit_graphs pgbench pgbench
+    fi
   else
     cat <<'EOF'
 Not run. The suite normally finishes with a real workload — a throwaway
@@ -1242,72 +1494,37 @@ run summary printed at the end says which.
 EOF
   fi
 
-  # ---- time series ------------------------------------------------------
-  cat <<EOF
-
-## Over time
-
-Every fio job also logs itself as a time series, one sample per
-${LOG_AVG_MSEC}ms window. The x axis is elapsed time **within that job**, so runs
-on different mounts line up even when they were minutes apart on the clock.
-
-Where a job does both reads and writes (\`rand_rw_70_30_4k\`) each direction is
-a separate line. Multi-job tests have their per-job samples summed for IOPS and
-bandwidth and averaged for latency, so the lines are the aggregate the tables
-report, not one worker's share of it. Latency uses a logarithmic y axis —
-storage latency spans orders of magnitude and a linear axis flattens everything
-below the worst spike into the baseline.
-
-What to look for: a flat line is a backend holding its service level; a decaying
-curve is usually a cache or write buffer filling; periodic collapses to near
-zero are flush or compaction stalls, which a whole-run average will not show you
-at all.
-
-EOF
-
-  graphed=0
-  for t in "${FIO_TESTS[@]}"; do
-    [ -f "$PLOTDIR/${t}_iops.svg" ] ||
-      [ -f "$PLOTDIR/${t}_bw.svg" ] ||
-      [ -f "$PLOTDIR/${t}_clat.svg" ] || continue
-    graphed=1
-    echo "### $t"
-    echo
-    for spec in "iops:IOPS" "bw:Bandwidth" "clat:Completion latency"; do
-      key="${spec%%:*}"
-      cap="${spec#*:}"
-      [ -f "$PLOTDIR/${t}_${key}.svg" ] || continue
-      # The alt text doubles as the caption: render_html lifts a paragraph that
-      # holds nothing but an image into a <figure> and reuses it as the
-      # <figcaption>, which is as close as Markdown gets to AsciiDoc's `.Title`.
-      echo "![${cap} — ${t}](graphs/${t}_${key}.svg)"
-      echo
-    done
-  done
-
-  if [ "$pgbench_graphed" = 1 ]; then
-    graphed=1
-    echo "### pgbench"
-    echo
+  # ---- per-pass detail --------------------------------------------------
+  # Only worth a section when there is more than one pass. With a single pass
+  # its charts are already the ones sitting next to the prose above, and
+  # repeating them here would just double the size of the HTML.
+  if [ "$REPEATS" -gt 1 ] && [ -n "$HEADLINE_GRAPHS" ]; then
     cat <<EOF
-pgbench aggregates its own log into fixed intervals and one second is the
-finest it will accept, so these are coarser than the fio graphs above — a stall
-shorter than a second is inside a sample rather than visible as one. The worst
-latency chart is the one to read for that: it plots the slowest single
-transaction in each interval, so a checkpoint or an fsync stall that the mean
-absorbs still shows as a spike.
+
+## Pass by pass
+
+The charts above are the mean of ${REPEATS} passes. These are the passes
+themselves, in the order they ran, for when the aggregate hides something the
+mean should not have smoothed: a first pass that was slower than the rest
+because a cache was cold, or one pass that stalled and pulled the band wide on
+its own.
+
+Each pass is a complete run of the suite, separated from the next by the same
+${SETTLE}s cooldown that separates runs within a pass.
 
 EOF
-    for spec in "tps:Transaction rate" "lat:Mean latency" "maxlat:Worst latency"; do
-      key="${spec%%:*}"
-      cap="${spec#*:}"
-      [ -f "$PLOTDIR/pgbench_${key}.svg" ] || continue
-      echo "![${cap} — pgbench](graphs/pgbench_${key}.svg)"
+    for rid in "${RUN_IDS[@]}"; do
+      echo "### $rid"
       echo
+      for t in "${FIO_TESTS[@]}"; do
+        emit_graphs "$t" "$t" "$rid"
+      done
+      [ "$pgbench_graphed" = 1 ] && emit_graphs pgbench pgbench "$rid"
     done
   fi
 
-  if [ "$graphed" = 0 ]; then
+  if [ -z "$HEADLINE_GRAPHS" ]; then
+    echo
     if [ "$have_gnuplot" = 1 ]; then
       echo "No time-series samples were produced — every fio job failed, or the"
       echo "runs were shorter than one ${LOG_AVG_MSEC}ms sample window."
@@ -1319,40 +1536,46 @@ EOF
     echo
   fi
 
-  cat <<'MDEOF'
+  cat <<MDEOF
 ## Raw output
 
-Unparsed dd output and fio terse lines are archived under `raw/`, one file per
-test per mount. The fio files are terse version 3 records — useful if you want
+Everything a pass produced sits under that pass's own directory, \`run-01\`,
+\`run-02\` and so on, because fio names its logs after the test rather than after
+the attempt and a second pass would otherwise overwrite the first.
+
+\`raw/<pass>/\` holds unparsed dd output and fio terse lines, one file per test
+per mount. The fio files are terse version 3 records — useful if you want
 latency percentiles or bandwidth min/max, which are not carried into the CSV
-above.
+above. \`raw/pgbench_<mount>.txt\` in the same directory holds everything pgbench
+and initdb printed, and \`raw/<pass>/pgbench_<mount>_server.log\` the postgres
+server log for that mount — checkpoint and autovacuum activity land there, which
+is usually where an unexplained dip in the transaction rate is explained. The
+\`df\` and \`/proc/mounts\` captures are properties of the mount rather than of a
+pass, so they sit above the per-pass directories in \`raw/\` itself.
 
-`raw/pgbench_<mount>.txt` holds everything pgbench and initdb printed, and
-`raw/pgbench_<mount>_server.log` the postgres server log for that mount —
-checkpoint and autovacuum activity land there, which is usually where an
-unexplained dip in the transaction rate is explained.
-
-`fio-logs/` holds fio's own time-series logs, named
-`<mount>_<test>_{bw,iops,lat,slat,clat}.log`, in fio's usual
-`time_ms, value, ddir, blocksize, offset` format (`ddir` 0 = read, 1 = write).
+\`fio-logs/<pass>/\` holds fio's own time-series logs, named
+\`<mount>_<test>_{bw,iops,lat,slat,clat}.log\`, in fio's usual
+\`time_ms, value, ddir, blocksize, offset\` format (\`ddir\` 0 = read, 1 = write).
 Bandwidth is KiB/s, latency is nanoseconds. Alongside them are pgbench's
-aggregate logs, `pgbench_<mount>.<pid>[.<thread>]`, one row per second per
-thread as `interval_start num_transactions sum_latency sum_latency_2
-min_latency max_latency` with latencies in microseconds.
+aggregate logs, \`pgbench_<mount>.<pid>[.<thread>]\`, one row per second per
+thread as \`interval_start num_transactions sum_latency sum_latency_2
+min_latency max_latency\` with latencies in microseconds.
 
-These are the unprocessed inputs to
-the graphs above, and the fio ones are in fio's standard log format, so `fio2gnuplot`
-and `fiologparser.py` will read them if you want to re-plot them differently.
-Neither ships in this image — both are Python, and CPython is most of what a
-benchmark image would otherwise carry.
+These are the unprocessed inputs to the charts above, and the fio ones are in
+fio's standard log format, so \`fio2gnuplot\` and \`fiologparser.py\` will read them
+if you want to re-plot them differently. Neither ships in this image — both are
+Python, and CPython is most of what a benchmark image would otherwise carry.
 
-`graphs/` holds the rendered SVGs alongside the gnuplot script and the reduced
-data files that produced each one, so any plot can be tweaked and redrawn
-without re-running the benchmark:
+\`graphs/<pass>/\` holds the rendered SVGs alongside the gnuplot script that drew
+each one, and \`graphs/data/<pass>/\` the reduced series they were drawn from, so
+any plot can be tweaked and redrawn without re-running the benchmark:
 
-```console
-$ gnuplot graphs/rand_read_4k_iops.gp
-```
+\`\`\`console
+\$ gnuplot graphs/${HEADLINE_GRAPHS:-run-01}/rand_read_4k_iops.gp
+\`\`\`
+
+The aggregate charts are in \`graphs/aggregate/\`, drawn from
+\`graphs/data/aggregate_*.dat\`, whose columns are \`time mean min max\`.
 MDEOF
 } >"$MD"
 
@@ -1574,17 +1797,24 @@ decorate() { # <data-uri map>
 
 render_html() { # <markdown> <html out>
   local md="$1" out="$2"
-  local map="$RAWDIR/graph-data-uri.map" f rc
+  local map="$MOUNTINFO/graph-data-uri.map" f rel rc
 
   # base64 rather than inlining the SVG markup: gnuplot gives every plot the
   # same element ids, and a dozen inline <svg> blocks sharing one id space would
   # have each of them resolve its <defs> references to the first plot on the
   # page. A data: URI keeps each graph in its own document, as a separate file
   # would have.
+  #
+  # The SVGs live one directory down, under the pass that drew them, so the key
+  # has to be the path relative to OUTDIR — which is what the Markdown refers to
+  # them by — rather than just the basename. Every pass names its charts
+  # identically, so a basename key would collide and every pass would show the
+  # first pass's graphs.
   : >"$map"
-  for f in "$PLOTDIR"/*.svg; do
+  for f in "$PLOTDIR"/*/*.svg; do
     [ -f "$f" ] || continue
-    printf '%s\t%s\n' "graphs/${f##*/}" \
+    rel="${f#"$OUTDIR"/}"
+    printf '%s\t%s\n' "$rel" \
       "data:image/svg+xml;base64,$(base64 -w0 "$f")" >>"$map"
   done
 
