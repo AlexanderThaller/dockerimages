@@ -131,17 +131,18 @@ let
 in
 {
   # Everything storage-bench.sh shells out to, plus the tool that renders its
-  # report. gawk/gnugrep parse fio's terse output and dd's summary line, gnused
-  # strips the unit off dd's elapsed time, and gawk also folds fio's time-series
-  # logs into the per-series data files that gnuplot draws — and assembles the
-  # HTML around cmark-gfm's output.
+  # report. gawk/gnugrep parse fio's terse output and pick the mount under test
+  # out of /proc/mounts, gnused pulls the figures out of pgbench's summary, and
+  # gawk also folds fio's time-series logs into the per-series data files that
+  # gnuplot draws — and assembles the HTML around cmark-gfm's output.
   #
   # coreutils covers more than it looks: `df` for the per-mount capacity in the
   # report, `uname -n` for its host header, which is why there is no hostname(1)
-  # here, and `base64` for inlining the graphs into the single-file HTML. The
-  # mount table comes from /proc/mounts, which is why there is no util-linux
-  # either — it was carried for that one command, and the full build links PAM,
-  # systemd and shadow behind it.
+  # here, and `base64` for inlining the graphs into the single-file HTML. It is
+  # no longer here for `dd` — the three dd tests are two fio jobs now — but the
+  # rest of that list keeps it. The mount table comes from /proc/mounts, which
+  # is why there is no util-linux either: it was carried for that one command,
+  # and the full build links PAM, systemd and shadow behind it.
   packages = [
     fio
     gnuplot

@@ -102,7 +102,7 @@ pkgs.dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.title" = "storage-bench";
       "org.opencontainers.image.description" =
-        "dd/fio/pgbench storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
+        "fio/pgbench storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
     };
   };
 }

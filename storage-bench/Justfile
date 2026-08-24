@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r6"
+tag := "2026-08-24-r7"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -94,7 +94,7 @@ _run-against imageref +hostpaths:
     done
     # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
     # `RUNDIR=before-upgrade just run /mnt/ceph`.
-    for v in ORDER REPEATS SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
+    for v in ORDER REPEATS SETTLE FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
              PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
@@ -122,8 +122,8 @@ _run-against imageref +hostpaths:
 shell: load
     {{ engine }} run --rm -it --entrypoint bash {{ image }}:{{ tag }}
 
-# Measures nothing useful — it exercises dd, fio, pgbench, the awk/sed parsing
-# and the report generator against a container-local tmpfs. Empty RUNDIR because
+# Measures nothing useful — it exercises fio, pgbench, the awk/sed parsing and
+# the report generator against a container-local tmpfs. Empty RUNDIR because
 # a throwaway check wants its output in one predictable place, not in a new
 # timestamped directory on every invocation. pgbench is pinned to scale 5 here
 # rather than the default 100: the tmpfs is RAM, and 1.6 GB of it is not what a
@@ -142,7 +142,7 @@ smoke: load
         --shm-size=256m \
         --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
         -v {{ results }}/smoke:/out -e OUTBASE=/out -e RUNDIR= \
-        -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
+        -e SETTLE=0 \
         -e FIO_SIZE=64M -e FIO_RUNTIME=2 -e REPEATS=3 \
         -e PGBENCH_SCALE=5 -e PGBENCH_CLIENTS=4 -e PGBENCH_JOBS=2 -e PGBENCH_TIME=5 \
         {{ run_args }} \

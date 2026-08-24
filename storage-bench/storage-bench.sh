@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# storage-bench.sh — dd + fio + pgbench benchmark across one or more mounted
-#                    PVCs, emitting CSV data files and a Markdown report.
+# storage-bench.sh — fio + pgbench benchmark across one or more mounted PVCs,
+#                    emitting CSV data files and a Markdown report.
 #
 # Usage:
 #   ./storage-bench.sh /data/ceph /data/portworx
@@ -50,8 +50,6 @@
 #   ORDER         by-mount | by-test            (default by-mount)
 #   REPEATS       times to run the whole suite  (default 3)
 #   SETTLE        seconds to idle between runs  (default 15)
-#   DD_ZERO_MB    size of the dd zero write     (default 1024)
-#   DD_RAND_MB    size of the dd urandom write  (default 256)
 #   FIO_SIZE      fio working set per job       (default 2G)
 #   FIO_RUNTIME   seconds per fio job           (default 30)
 #   IOENGINE      fio ioengine                  (default libaio)
@@ -64,12 +62,22 @@
 #   PLOT          1|0, draw the gnuplot graphs  (default 1)
 #   RENDER        html|none                     (default html)
 #
-# dd and fio measure the storage directly. pgbench measures what a real
-# application gets out of it: a throwaway PostgreSQL cluster is initialised on
-# each mount in turn, loaded, and driven through the built-in TPC-B-like
-# workload. The numbers are lower than fio's and that is the point — they carry
-# the WAL, the checkpointer and the page cache that sit between an application
-# and the disk, none of which fio models.
+# fio measures the storage directly. pgbench measures what a real application
+# gets out of it: a throwaway PostgreSQL cluster is initialised on each mount in
+# turn, loaded, and driven through the built-in TPC-B-like workload. The numbers
+# are lower than fio's and that is the point — they carry the WAL, the
+# checkpointer and the page cache that sit between an application and the disk,
+# none of which fio models.
+#
+# There used to be three dd tests here and there are now two more fio jobs
+# instead. dd was doing three things: a 1 MiB sequential write of zeros, the
+# same write from /dev/urandom, and a sequential read back with O_DIRECT. The
+# read is `seq_read_1m` and always was — same block size, same direction, and
+# O_DIRECT without dd's fallback to the page cache. The writes measured what the
+# backend does with the *content*, and that is now `seq_write_zero_1m` and
+# `seq_write_rand_1m`: `seq_write_1m` with one flag changed each, so all three
+# are directly comparable, and all three carry the time series, the IOPS and the
+# latency columns that dd's single parsed-out throughput figure never had.
 #
 # Runs unprivileged — no root, no SCC changes needed. PostgreSQL refuses to run
 # as root, so the pgbench workload is skipped rather than run in that case.
@@ -96,8 +104,6 @@ OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
 REPEATS="${REPEATS:-3}"
 SETTLE="${SETTLE:-15}"
-DD_ZERO_MB="${DD_ZERO_MB:-10240}"
-DD_RAND_MB="${DD_RAND_MB:-10240}"
 FIO_SIZE="${FIO_SIZE:-10G}"
 FIO_RUNTIME="${FIO_RUNTIME:-60}"
 IOENGINE="${IOENGINE:-libaio}"
@@ -160,7 +166,7 @@ html | none) ;;
 esac
 
 # Checked up front rather than left to pgbench, which would otherwise fail an
-# hour into the run, after dd and fio have already been paid for.
+# hour into the run, after fio has already been paid for.
 for v in REPEATS PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME; do
   case "${!v}" in
   '' | *[!0-9]*)
@@ -181,7 +187,6 @@ done
   exit 1
 }
 
-DD_CSV="$OUTDIR/dd_results.csv"
 FIO_CSV="$OUTDIR/fio_results.csv"
 PG_CSV="$OUTDIR/pgbench_results.csv"
 MD="$OUTDIR/storage-benchmark-report.md"
@@ -225,10 +230,9 @@ mkdir -p "$MOUNTINFO" "$PLOTDIR" || {
 # Tests in execution order. Read tests depend on the write test that precedes
 # them, so this order matters in both ORDER modes.
 TESTS=(
-  dd_write_zero
-  dd_write_urandom
-  dd_read
   seq_write_1m
+  seq_write_zero_1m
+  seq_write_rand_1m
   seq_read_1m
   rand_write_4k
   rand_read_4k
@@ -422,8 +426,8 @@ owning_mount() { # <path>
 
 # Register the files we will create so cleanup can remove them.
 for mp in "${USABLE[@]}"; do
-  CREATED+=("$mp/ddbench.zero" "$mp/ddbench.rand"
-    "$mp/fio_seq.dat" "$mp/fio_rand.dat" "$mp/fio_mix.dat" "$mp/fio_sync.dat")
+  CREATED+=("$mp/fio_seq.dat" "$mp/fio_seq_zero.dat" "$mp/fio_seq_rand.dat"
+    "$mp/fio_rand.dat" "$mp/fio_mix.dat" "$mp/fio_sync.dat")
   sl="$(slug "$mp")"
   df -h "$mp" >"$MOUNTINFO/df_${sl}.txt" 2>&1
   # /proc/mounts rather than mount(8): the same device/fstype/options in the
@@ -438,49 +442,9 @@ for mp in "${USABLE[@]}"; do
   fi
 done
 
-echo "run,mount,test,size_mb,throughput,elapsed_s" >"$DD_CSV"
 echo "run,mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
 [ "$have_pgbench" = 1 ] &&
   echo "run,mount,scale,clients,threads,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
-
-# ---------------------------------------------------------------------------
-# dd helpers
-# ---------------------------------------------------------------------------
-# dd prints its summary to stderr as:
-#   1073741824 bytes (1.1 GB, 1.0 GiB) copied, 3.5 s, 307 MB/s
-# Split on commas and take the last two fields.
-parse_dd() {
-  local out="$1" line
-  line="$(printf '%s\n' "$out" | tail -1)"
-  DD_SPEED="$(printf '%s' "$line" | awk -F, '{gsub(/^ +| +$/,"",$NF); print $NF}')"
-  DD_ELAPSED="$(printf '%s' "$line" | awk -F, '{print $(NF-1)}' | sed 's/[^0-9.]//g')"
-  [ -z "$DD_SPEED" ] && DD_SPEED="n/a"
-  [ -z "$DD_ELAPSED" ] && DD_ELAPSED="n/a"
-}
-
-run_dd() {
-  local mp="$1" name="$2" size_mb="$3"
-  shift 3
-  local sl
-  sl="$(slug "$mp")"
-  local raw="$RAWDIR/dd_${sl}_${name}.txt"
-  local out rc
-
-  info "dd $name ..."
-  out="$("$@" 2>&1)"
-  rc=$?
-  printf '%s\n' "$out" >"$raw"
-
-  if [ $rc -ne 0 ]; then
-    info "  FAILED (see $raw)"
-    echo "$RUN_ID,$mp,$name,$size_mb,FAILED,FAILED" >>"$DD_CSV"
-    return 1
-  fi
-
-  parse_dd "$out"
-  info "  $DD_SPEED  (${DD_ELAPSED}s)"
-  echo "$RUN_ID,$mp,$name,$size_mb,$DD_SPEED,$DD_ELAPSED" >>"$DD_CSV"
-}
 
 # ---------------------------------------------------------------------------
 # fio helper
@@ -670,43 +634,44 @@ run_pgbench() { # <mount>
 # ---------------------------------------------------------------------------
 run_test() {
   local mp="$1" test="$2"
-  local zerofile="$mp/ddbench.zero"
-  local randfile="$mp/ddbench.rand"
 
   case "$test" in
-
-  dd_write_zero)
-    run_dd "$mp" dd_write_zero "$DD_ZERO_MB" \
-      dd if=/dev/zero of="$zerofile" bs=1M count="$DD_ZERO_MB" conv=fdatasync
-    ;;
-
-  # Largely a CPU benchmark — /dev/urandom generation is the bottleneck on
-  # most systems, not the storage. Useful only to see whether incompressible
-  # data behaves differently from zeros, which matters on backends doing
-  # inline compression or dedup. Kept small for that reason.
-  dd_write_urandom)
-    run_dd "$mp" dd_write_urandom "$DD_RAND_MB" \
-      dd if=/dev/urandom of="$randfile" bs=1M count="$DD_RAND_MB" conv=fdatasync
-    ;;
-
-  # O_DIRECT bypasses the page cache. Without it you are mostly re-reading
-  # RAM. If the filesystem rejects O_DIRECT, fall back and flag it.
-  dd_read)
-    if dd if="$zerofile" of=/dev/null bs=1M count=1 iflag=direct >/dev/null 2>&1; then
-      run_dd "$mp" dd_read_direct "$DD_ZERO_MB" \
-        dd if="$zerofile" of=/dev/null bs=1M count="$DD_ZERO_MB" iflag=direct
-    else
-      info "O_DIRECT unsupported here — reading through page cache (numbers will be inflated)"
-      run_dd "$mp" dd_read_cached "$DD_ZERO_MB" \
-        dd if="$zerofile" of=/dev/null bs=1M count="$DD_ZERO_MB"
-    fi
-    ;;
 
   seq_write_1m)
     run_fio "$mp" seq_write_1m \
       --name=seq_write_1m --filename=fio_seq.dat --rw=write --bs=1M \
       --size="$FIO_SIZE" --numjobs=1 --iodepth=16 --direct=1 \
       --ioengine="$IOENGINE" --runtime="$FIO_RUNTIME" --time_based
+    ;;
+
+  # The two jobs dd used to be, and the only two in the suite that differ in
+  # what is *in* the buffer rather than in how it is written. Everything else
+  # about them matches seq_write_1m, which is what makes the three comparable:
+  # a backend that stores what it is given returns the same number three times,
+  # and one that compresses or deduplicates does not.
+  #
+  # --zero_buffers: every block is zeros, so maximally compressible and, being
+  # all identical, maximally dedupable. The optimistic bound.
+  seq_write_zero_1m)
+    run_fio "$mp" seq_write_zero_1m \
+      --name=seq_write_zero_1m --filename=fio_seq_zero.dat --rw=write --bs=1M \
+      --size="$FIO_SIZE" --numjobs=1 --iodepth=16 --direct=1 \
+      --ioengine="$IOENGINE" --runtime="$FIO_RUNTIME" --time_based \
+      --zero_buffers
+    ;;
+
+  # --refill_buffers: fresh random data for every block, so nothing to compress
+  # and no two blocks alike. Note this is not fio's default, which seq_write_1m
+  # uses: that fills one buffer at startup and rewrites it, which is
+  # incompressible but perfectly dedupable — a third case dd could not express
+  # at all. Where dd if=/dev/urandom was mostly measuring how fast the kernel
+  # generates randomness, fio's PRNG is fast enough to measure the storage.
+  seq_write_rand_1m)
+    run_fio "$mp" seq_write_rand_1m \
+      --name=seq_write_rand_1m --filename=fio_seq_rand.dat --rw=write --bs=1M \
+      --size="$FIO_SIZE" --numjobs=1 --iodepth=16 --direct=1 \
+      --ioengine="$IOENGINE" --runtime="$FIO_RUNTIME" --time_based \
+      --refill_buffers
     ;;
 
   seq_read_1m)
@@ -823,10 +788,11 @@ ELAPSED=$(($(date +%s) - START_EPOCH))
 # ---------------------------------------------------------------------------
 DDIR_NAME=(read write)
 
+# Every test but pgbench is an fio job, and has been since dd left.
 FIO_TESTS=()
 for t in "${TESTS[@]}"; do
   case "$t" in
-  dd_* | pgbench) ;;
+  pgbench) ;;
   *) FIO_TESTS+=("$t") ;;
   esac
 done
@@ -846,12 +812,44 @@ it can produce. This is the figure that predicts bulk restores, backup writes,
 image pulls and log shipping.
 EOF
     ;;
+  seq_write_zero_1m)
+    cat <<'EOF'
+`seq_write_1m` again, with `--zero_buffers`: every block written is zeros. That
+is the most compressible and the most dedupable data there is, so a backend
+doing either inline will beat its own `seq_write_1m` figure here, sometimes by
+an order of magnitude, without a byte of it reaching a disk. A backend that
+stores what it is given produces the same number twice.
+
+This is one half of what `dd if=/dev/zero` was for. It is the optimistic bound:
+no real workload writes only zeros, and any storage vendor's headline
+throughput figure that looks like this one is quoting it.
+EOF
+    ;;
+  seq_write_rand_1m)
+    cat <<'EOF'
+The pessimistic bound, and the other half. `--refill_buffers` makes fio
+generate fresh random data for every block, so there is nothing to compress and
+no two blocks alike to deduplicate — the backend has to store all of it.
+
+Note that this is not the same as fio's default, which `seq_write_1m` uses:
+that fills one buffer with random data at startup and writes *the same buffer*
+over and over, which is incompressible but perfectly dedupable. Three jobs,
+three answers, and the spread between them is the size of the backend's
+data-reduction claim. Where `dd if=/dev/urandom` was mostly measuring how fast
+the kernel could generate randomness, fio's PRNG is fast enough that this
+measures the storage.
+EOF
+    ;;
   seq_read_1m)
     cat <<'EOF'
 Streaming read bandwidth, reading back the file `seq_write_1m` just wrote. Same
 shape as the write test, so the two are directly comparable; a backend that
 reads much faster than it writes is usually acknowledging writes to a slower
 durable tier, or replicating them.
+
+O_DIRECT, like everything else here, so this is the storage rather than the
+page cache — which is what `dd iflag=direct` was checking, and this one cannot
+silently fall back to a cached read the way dd did.
 EOF
     ;;
   rand_write_4k)
@@ -1447,8 +1445,6 @@ log "Writing report"
 | Run order             | ${ORDER} |
 | Passes over the suite | ${REPEATS} |
 | Settle between runs   | ${SETTLE}s |
-| dd zero write size    | ${DD_ZERO_MB} MiB |
-| dd urandom write size | ${DD_RAND_MB} MiB |
 | fio working set       | ${FIO_SIZE} |
 | fio runtime per job   | ${FIO_RUNTIME}s |
 | fio ioengine          | ${IOENGINE} |
@@ -1460,10 +1456,9 @@ log "Writing report"
 * Run order was \`${ORDER}\`. In \`by-mount\` each mount gets an uninterrupted block of tests; in \`by-test\` the mounts are paired closely in time so shared backend load hits both about equally. If the two paths share physical hardware, \`by-test\` is the fairer head-to-head.
 * A ${SETTLE}s idle period separates consecutive runs so the backend can finish flushing before the next measurement starts.
 * What each fio job measures, and the exact command it ran, is in [fio tests](#fio-tests) — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
-* The \`dd_write_urandom\` figure is **CPU-bound in most environments** — \`/dev/urandom\` generation, not the disk, is usually the limiting factor. Treat it as a check on how the backend handles incompressible data (relevant if it does inline compression or dedup), not as a throughput measurement.
-* \`dd_read_direct\` bypasses the page cache. If it appears as \`dd_read_cached\` instead, the filesystem rejected O_DIRECT and that number is inflated by RAM caching.
+* \`seq_write_1m\`, \`seq_write_zero_1m\` and \`seq_write_rand_1m\` are the same job with different data in the buffer: whatever fio writes by default, all zeros, and fresh random bytes per block. On a backend that stores what it is given they are one number three times. Where they diverge, the backend is looking at the content — zeros compressing away, or identical blocks being deduplicated — and the write figures for real data are somewhere between the two extremes rather than at either.
 * If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
-* dd and fio measure the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
+* fio measures the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
 * The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. The time-series chart under each test in [fio tests](#fio-tests) is where that shows.
 
@@ -1482,17 +1477,6 @@ EOF
     echo '```'
     echo
   done
-
-  cat <<'MDEOF'
-## dd results
-
-Sequential, single-stream. Writes use `conv=fdatasync` so the data is committed
-before dd reports its timing. Rows appear in execution order.
-
-MDEOF
-
-  csv_table "$DD_CSV"
-  echo
 
   # ---- what each fio job actually ran ------------------------------------
   cat <<EOF
@@ -1698,10 +1682,9 @@ Everything a pass produced sits under that pass's own directory, \`run-01\`,
 \`run-02\` and so on, because fio names its logs after the test rather than after
 the attempt and a second pass would otherwise overwrite the first.
 
-\`raw/<pass>/\` holds unparsed dd output and fio terse lines, one file per test
-per mount. The fio files are terse version 3 records — useful if you want
-latency percentiles or bandwidth min/max, which are not carried into the CSV
-above. \`raw/pgbench_<mount>.txt\` in the same directory holds everything pgbench
+\`raw/<pass>/\` holds fio's terse lines, one file per test per mount. They are
+terse version 3 records — useful if you want latency percentiles or bandwidth
+min/max, which are not carried into the CSV above. \`raw/pgbench_<mount>.txt\` in the same directory holds everything pgbench
 and initdb printed, and \`raw/<pass>/pgbench_<mount>_server.log\` the postgres
 server log for that mount — checkpoint and autovacuum activity land there, which
 is usually where an unexplained dip in the transaction rate is explained. The
@@ -2002,8 +1985,7 @@ echo
 echo "Done in ${ELAPSED}s."
 echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
-echo "  CSVs     : $DD_CSV"
-echo "             $FIO_CSV"
+echo "  CSVs     : $FIO_CSV"
 [ "$have_pgbench" = 1 ] && echo "             $PG_CSV"
 if [ "$have_gnuplot" = 1 ]; then
   echo "  Graphs   : $PLOTDIR/"
