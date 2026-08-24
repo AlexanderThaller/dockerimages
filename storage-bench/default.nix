@@ -1,5 +1,5 @@
 # storage-bench — a container image that runs ./storage-bench.sh, with fio,
-# gnuplot, cmark-gfm and bash.
+# gnuplot, postgresql, cmark-gfm and bash.
 #
 #   nix-build                       # -> ./result, a docker image tarball
 #   docker load < result            # or: podman load < result
@@ -59,9 +59,29 @@ pkgs.dockerTools.buildLayeredImage {
 
   # storage-bench.sh writes its results under $OUTDIR, /tmp by default, and
   # /data is where the volumes under test are expected to be mounted.
+  #
+  # /etc/passwd is rewritten as a real, writable file. fakeNss leaves it as a
+  # symlink into the store, which is read-only and knows only root and nobody —
+  # and PostgreSQL resolves the uid it is running as through getpwuid() and
+  # treats a failed lookup as fatal, so initdb stops dead under the `--user
+  # <caller uid>` this is meant to be run with. storage-bench.sh appends a line
+  # for itself at startup; see ensure_passwd_entry there.
+  #
+  # The two entries below are fakeNss's own, reproduced because the symlink is
+  # being replaced rather than edited. Mode 0666 is what lets an arbitrary uid
+  # add its line: the alternative is knowing the uid at build time, which is
+  # exactly what is not known. Nothing in this image authenticates anything —
+  # it runs one script and exits — so there is no privilege here to escalate.
   extraCommands = ''
     mkdir -p -m 1777 tmp
-    mkdir -p data
+    mkdir -p data etc
+    # Unlinked first, not truncated: it is a symlink into the store at this
+    # point, and redirecting into it would follow it there and be refused.
+    rm -f etc/passwd
+    printf '%s\n' \
+      'root:x:0:0:root user:/var/empty:/bin/sh' \
+      'nobody:x:65534:65534:nobody:/var/empty:/bin/sh' > etc/passwd
+    chmod 0666 etc/passwd
   '';
 
   config = {
@@ -82,7 +102,7 @@ pkgs.dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.title" = "storage-bench";
       "org.opencontainers.image.description" =
-        "dd/fio storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
+        "dd/fio/pgbench storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
     };
   };
 }

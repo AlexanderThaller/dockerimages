@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# storage-bench.sh — dd + fio benchmark across one or more mounted PVCs,
-#                    emitting CSV data files and a Markdown report.
+# storage-bench.sh — dd + fio + pgbench benchmark across one or more mounted
+#                    PVCs, emitting CSV data files and a Markdown report.
 #
 # Usage:
 #   ./storage-bench.sh /data/ceph /data/portworx
@@ -39,10 +39,23 @@
 #   FIO_RUNTIME   seconds per fio job           (default 30)
 #   IOENGINE      fio ioengine                  (default libaio)
 #   LOG_AVG_MSEC  fio time-series sample window (default 100)
+#   PGBENCH       1|0, run the postgres workload(default 1)
+#   PGBENCH_SCALE pgbench scale factor          (default 100, ~1.6 GiB)
+#   PGBENCH_CLIENTS  concurrent pgbench clients (default 8)
+#   PGBENCH_JOBS  pgbench worker threads        (default 4)
+#   PGBENCH_TIME  seconds of timed pgbench run  (default 60)
 #   PLOT          1|0, draw the gnuplot graphs  (default 1)
 #   RENDER        html|none                     (default html)
 #
-# Runs unprivileged — no root, no SCC changes needed.
+# dd and fio measure the storage directly. pgbench measures what a real
+# application gets out of it: a throwaway PostgreSQL cluster is initialised on
+# each mount in turn, loaded, and driven through the built-in TPC-B-like
+# workload. The numbers are lower than fio's and that is the point — they carry
+# the WAL, the checkpointer and the page cache that sit between an application
+# and the disk, none of which fio models.
+#
+# Runs unprivileged — no root, no SCC changes needed. PostgreSQL refuses to run
+# as root, so the pgbench workload is skipped rather than run in that case.
 
 set -uo pipefail
 export LC_ALL=C
@@ -71,8 +84,19 @@ FIO_SIZE="${FIO_SIZE:-10G}"
 FIO_RUNTIME="${FIO_RUNTIME:-60}"
 IOENGINE="${IOENGINE:-libaio}"
 LOG_AVG_MSEC="${LOG_AVG_MSEC:-100}"
+PGBENCH="${PGBENCH:-1}"
+PGBENCH_SCALE="${PGBENCH_SCALE:-100}"
+PGBENCH_CLIENTS="${PGBENCH_CLIENTS:-8}"
+PGBENCH_JOBS="${PGBENCH_JOBS:-4}"
+PGBENCH_TIME="${PGBENCH_TIME:-60}"
 PLOT="${PLOT:-1}"
 RENDER="${RENDER:-html}"
+
+# pgbench aggregates its own log into fixed intervals and one second is the
+# finest it accepts, so unlike LOG_AVG_MSEC this is not a tunable — it is the
+# floor. It is named here because the report quotes it and pgbench_series
+# divides by it.
+PGBENCH_AGG_INTERVAL=1
 
 case "$ORDER" in
 by-mount | by-test) ;;
@@ -117,8 +141,31 @@ html | none) ;;
   ;;
 esac
 
+# Checked up front rather than left to pgbench, which would otherwise fail an
+# hour into the run, after dd and fio have already been paid for.
+for v in PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME; do
+  case "${!v}" in
+  '' | *[!0-9]*)
+    echo "$v must be a positive integer (got '${!v}')" >&2
+    exit 1
+    ;;
+  esac
+  [ "${!v}" -ge 1 ] || {
+    echo "$v must be >= 1 (got '${!v}')" >&2
+    exit 1
+  }
+done
+
+# pgbench divides its clients between its threads and refuses the run outright
+# if the division leaves a thread with none.
+[ "$PGBENCH_JOBS" -le "$PGBENCH_CLIENTS" ] || {
+  echo "PGBENCH_JOBS ($PGBENCH_JOBS) cannot exceed PGBENCH_CLIENTS ($PGBENCH_CLIENTS)" >&2
+  exit 1
+}
+
 DD_CSV="$OUTDIR/dd_results.csv"
 FIO_CSV="$OUTDIR/fio_results.csv"
+PG_CSV="$OUTDIR/pgbench_results.csv"
 MD="$OUTDIR/storage-benchmark-report.md"
 RAWDIR="$OUTDIR/raw"
 LOGDIR="$OUTDIR/fio-logs" # fio's own time-series logs, one set per test
@@ -142,16 +189,39 @@ TESTS=(
   rand_read_4k
   rand_rw_70_30_4k
   fsync_8k_qd1
+  pgbench
 )
 
 # Filled in by run_fio, read by the report: test name -> the flags it was given.
 declare -A FIO_ARGS=()
 
 CREATED=()
+
+# pgbench state that has to survive a Ctrl-C: a running postmaster keeps the
+# mount busy and holds its data directory open, and the clusters are large
+# enough (PGBENCH_SCALE 100 is ~1.6 GiB) that leaving them behind on someone's
+# storage is not acceptable.
+PG_DATADIRS=() # every cluster initdb created, across all mounts
+PG_ACTIVE=""   # the one with a postmaster currently up, if any
+PG_SOCKDIR=""
+
 cleanup() {
   echo
   echo "Cleaning up test files..."
   for f in "${CREATED[@]:-}"; do [ -n "$f" ] && rm -f "$f"; done
+
+  if [ -n "$PG_ACTIVE" ]; then
+    echo "Stopping postgres..."
+    pg_ctl -D "$PG_ACTIVE" -m immediate -w stop >/dev/null 2>&1
+    PG_ACTIVE=""
+  fi
+  # The PG_VERSION test is what makes the rm -rf safe: it fires only on a
+  # directory postgres itself created, never on a mount point that a bad
+  # expansion happened to name.
+  for d in "${PG_DATADIRS[@]:-}"; do
+    [ -n "$d" ] && [ -f "$d/PG_VERSION" ] && rm -rf "$d"
+  done
+  [ -n "$PG_SOCKDIR" ] && rm -rf "$PG_SOCKDIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -193,6 +263,66 @@ if [ "$RENDER" != "none" ] && ! command -v cmark-gfm >/dev/null 2>&1; then
   echo "NOTE cmark-gfm not found in PATH — report stays as Markdown source" >&2
   MISSING+=("cmark-gfm — the report was not rendered")
   RENDER=none
+fi
+
+# PostgreSQL resolves the uid it is running as through getpwuid() and treats a
+# failed lookup as fatal — initdb stops at "could not look up effective user
+# ID". In a container that is the normal case, not the exception: the image
+# knows root and nobody, and the benchmark is deliberately run under the
+# caller's uid so the reports are not left root-owned. The image therefore
+# ships /etc/passwd as a writable file rather than the usual read-only symlink
+# into the store, and this adds the missing line. On a host the entry is
+# already there and nothing is written.
+ensure_passwd_entry() {
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  has_passwd_entry() { awk -F: -v u="$uid" '$3 == u { f = 1 } END { exit !f }' /etc/passwd 2>/dev/null; }
+
+  has_passwd_entry && return 0
+  [ -w /etc/passwd ] || return 1
+  printf 'storagebench:x:%s:%s:storage-bench:%s:/bin/sh\n' \
+    "$uid" "$gid" "${HOME:-/tmp}" >>/etc/passwd
+  has_passwd_entry
+}
+
+have_pgbench=0
+if [ "$PGBENCH" = "1" ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "NOTE running as uid 0 — postgres refuses to run as root, skipping pgbench" >&2
+    MISSING+=("pgbench — skipped, postgres will not run as root")
+  elif ! command -v initdb >/dev/null 2>&1 ||
+    ! command -v pg_ctl >/dev/null 2>&1 ||
+    ! command -v pgbench >/dev/null 2>&1; then
+    echo "NOTE postgres not found in PATH — the report will have NO PGBENCH RESULTS" >&2
+    MISSING+=("postgresql — the pgbench workload did not run")
+  elif ! ensure_passwd_entry; then
+    echo "NOTE uid $(id -u) has no /etc/passwd entry and it is not writable —" >&2
+    echo "     postgres cannot start, skipping pgbench" >&2
+    MISSING+=("passwd entry for uid $(id -u) — the pgbench workload did not run")
+  else
+    have_pgbench=1
+    PG_VERSION="$(postgres --version 2>/dev/null | awk '{print $NF}')"
+    [ -n "$PG_VERSION" ] || PG_VERSION="(unknown version)"
+  fi
+fi
+
+# The socket lives off the mount under test, in TMPDIR, for two reasons: a unix
+# socket on the storage being hammered is not something to measure, and the
+# path has to fit in sockaddr_un.sun_path, which is 108 bytes including the
+# ".s.PGSQL.5432" the server appends. A deep OUTDIR would blow that; TMPDIR
+# usually will not, and if it does the workload is skipped rather than failing
+# halfway through the run.
+if [ "$have_pgbench" = 1 ]; then
+  PG_SOCKDIR="$(mktemp -d 2>/dev/null)"
+  if [ -z "$PG_SOCKDIR" ] || [ ${#PG_SOCKDIR} -gt 90 ]; then
+    echo "NOTE cannot make a short enough socket directory under ${TMPDIR:-/tmp} —" >&2
+    echo "     skipping pgbench (unix socket paths are limited to 108 bytes)" >&2
+    MISSING+=("pgbench — no usable socket directory under ${TMPDIR:-/tmp}")
+    [ -n "$PG_SOCKDIR" ] && rmdir "$PG_SOCKDIR" 2>/dev/null
+    PG_SOCKDIR=""
+    have_pgbench=0
+  fi
 fi
 
 USABLE=()
@@ -238,6 +368,8 @@ done
 
 echo "mount,test,size_mb,throughput,elapsed_s" >"$DD_CSV"
 echo "mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
+[ "$have_pgbench" = 1 ] &&
+  echo "mount,scale,clients,threads,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
 
 # ---------------------------------------------------------------------------
 # dd helpers
@@ -330,6 +462,138 @@ run_fio() {
 }
 
 # ---------------------------------------------------------------------------
+# pgbench
+#
+# A throwaway PostgreSQL cluster per mount, initialised on the storage under
+# test, loaded with pgbench's TPC-B-like schema and then driven for a fixed
+# time. Where fio asks how many 8 KiB writes the device can retire, this asks
+# what a database actually gets: every transaction here carries a WAL write and
+# an fsync at commit, a heap and index update that the checkpointer has to
+# write back later, and full-page images after each checkpoint.
+#
+# Settings are stated on the command line rather than edited into
+# postgresql.conf, so the cluster on disk is stock and the report can quote
+# exactly what was changed. The three durability settings are already the
+# defaults; they are named because they are the ones that make this a storage
+# benchmark rather than a memory benchmark, and a future postgres that shipped
+# different defaults would otherwise silently change what is measured.
+#
+# shared_buffers is deliberately left at its 128 MB default. A cluster that
+# cached the whole working set would report the speed of RAM.
+# ---------------------------------------------------------------------------
+pg_conf_args() {
+  printf '%s' \
+    "-c listen_addresses='' " \
+    "-c unix_socket_directories=$PG_SOCKDIR " \
+    "-c fsync=on " \
+    "-c synchronous_commit=on " \
+    "-c full_page_writes=on " \
+    "-c max_connections=$((PGBENCH_CLIENTS + 8))"
+}
+
+run_pgbench() { # <mount>
+  local mp="$1" sl pgdata prefix raw out rc
+  local init_s tps lat txns failed
+
+  sl="$(slug "$mp")"
+  pgdata="$mp/pgdata"
+  prefix="$LOGDIR/pgbench_${sl}"
+  raw="$RAWDIR/pgbench_${sl}.txt"
+
+  local failrow="$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,FAILED,FAILED,FAILED,FAILED,FAILED"
+
+  # A cluster left behind by an earlier run would mean measuring a load that
+  # never happened, so each run starts from initdb.
+  rm -rf "$pgdata"
+  PG_DATADIRS+=("$pgdata")
+
+  info "pgbench initdb ..."
+  if ! initdb -D "$pgdata" -U postgres --locale=C --encoding=UTF8 -A trust \
+    >"$raw" 2>&1; then
+    info "  initdb FAILED (see $raw)"
+    echo "$failrow" >>"$PG_CSV"
+    return 1
+  fi
+
+  info "pgbench starting postgres ..."
+  # -w with a generous timeout: the server has to fsync its way through
+  # startup on storage that may be slow, which is after all the point.
+  if ! pg_ctl -D "$pgdata" -l "$RAWDIR/pgbench_${sl}_server.log" -w -t 120 \
+    -o "$(pg_conf_args)" start >>"$raw" 2>&1; then
+    info "  postgres FAILED to start (see $RAWDIR/pgbench_${sl}_server.log)"
+    echo "$failrow" >>"$PG_CSV"
+    return 1
+  fi
+  PG_ACTIVE="$pgdata"
+
+  if ! createdb -h "$PG_SOCKDIR" -U postgres bench >>"$raw" 2>&1; then
+    info "  createdb FAILED (see $raw)"
+    pg_ctl -D "$pgdata" -m immediate -w stop >/dev/null 2>&1
+    PG_ACTIVE=""
+    echo "$failrow" >>"$PG_CSV"
+    return 1
+  fi
+
+  # ---- load ------------------------------------------------------------
+  # Bulk write throughput through the database rather than through dd: table
+  # heap, index build and the vacuum that follows. pgbench times itself, and
+  # its own figure is used rather than a wall clock around it so the number
+  # means the same thing as the one pgbench prints.
+  info "pgbench load (scale $PGBENCH_SCALE) ..."
+  out="$(pgbench -i -s "$PGBENCH_SCALE" -h "$PG_SOCKDIR" -U postgres bench 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" >>"$raw"
+  if [ $rc -ne 0 ]; then
+    info "  load FAILED (see $raw)"
+    pg_ctl -D "$pgdata" -m immediate -w stop >/dev/null 2>&1
+    PG_ACTIVE=""
+    echo "$failrow" >>"$PG_CSV"
+    return 1
+  fi
+  init_s="$(printf '%s\n' "$out" | sed -n 's/^done in \([0-9.]*\) s .*/\1/p' | tail -1)"
+  [ -z "$init_s" ] && init_s="n/a"
+  info "  loaded in ${init_s}s"
+
+  # ---- timed run -------------------------------------------------------
+  # --log with --aggregate-interval gives one row per interval per thread,
+  # which pgbench_series folds back together for the graphs. Without the
+  # aggregate it would log every single transaction — millions of lines.
+  info "pgbench run (${PGBENCH_CLIENTS} clients, ${PGBENCH_TIME}s) ..."
+  rm -f "$prefix".*
+  out="$(pgbench -h "$PG_SOCKDIR" -U postgres \
+    -c "$PGBENCH_CLIENTS" -j "$PGBENCH_JOBS" -T "$PGBENCH_TIME" \
+    --log --log-prefix="$prefix" \
+    --aggregate-interval="$PGBENCH_AGG_INTERVAL" bench 2>&1)"
+  rc=$?
+  printf '%s\n' "$out" >>"$raw"
+
+  pg_ctl -D "$pgdata" -m immediate -w stop >/dev/null 2>&1
+  PG_ACTIVE=""
+
+  if [ $rc -ne 0 ]; then
+    info "  run FAILED (see $raw)"
+    echo "$failrow" >>"$PG_CSV"
+    rm -rf "$pgdata"
+    return 1
+  fi
+
+  tps="$(printf '%s\n' "$out" | sed -n 's/^tps = \([0-9.]*\).*/\1/p' | tail -1)"
+  lat="$(printf '%s\n' "$out" | sed -n 's/^latency average = \([0-9.]*\) ms.*/\1/p' | tail -1)"
+  txns="$(printf '%s\n' "$out" | sed -n 's/^number of transactions actually processed: \([0-9]*\).*/\1/p' | tail -1)"
+  failed="$(printf '%s\n' "$out" | sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' | tail -1)"
+  [ -z "$tps" ] && tps="n/a"
+  [ -z "$lat" ] && lat="n/a"
+  [ -z "$txns" ] && txns="n/a"
+  [ -z "$failed" ] && failed=0
+
+  info "  $tps tps, ${lat}ms mean latency"
+  echo "$mp,$PGBENCH_SCALE,$PGBENCH_CLIENTS,$PGBENCH_JOBS,$PGBENCH_TIME,$init_s,$tps,$lat,$txns,$failed" >>"$PG_CSV"
+
+  # The cluster is ~16 MiB per scale point and the next mount wants the space.
+  rm -rf "$pgdata"
+}
+
+# ---------------------------------------------------------------------------
 # One test against one mount
 # ---------------------------------------------------------------------------
 run_test() {
@@ -411,6 +675,13 @@ run_test() {
       --ioengine=psync --runtime="$FIO_RUNTIME" --time_based
     ;;
 
+  # Skipped rather than failed when postgres is unavailable — the preflight has
+  # already said why, and the rest of the suite is still worth finishing.
+  pgbench)
+    [ "$have_pgbench" = 1 ] || return 0
+    run_pgbench "$mp"
+    ;;
+
   *)
     echo "unknown test: $test" >&2
     return 1
@@ -468,7 +739,7 @@ DDIR_NAME=(read write)
 FIO_TESTS=()
 for t in "${TESTS[@]}"; do
   case "$t" in
-  dd_*) ;;
+  dd_* | pgbench) ;;
   *) FIO_TESTS+=("$t") ;;
   esac
 done
@@ -560,35 +831,57 @@ fio_series() { # <logfile> <ddir> <sum|avg> <scale> <drop_nonpositive>
     }' "$f" | sort -n
 }
 
-# One SVG for one (test, metric), overlaying every mount and direction that
-# produced samples. Returns non-zero if there was nothing to draw.
-plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <logscale>
-  local test="$1" suffix="$2" key="$3" mode="$4" scale="$5"
-  local ylabel="$6" desc="$7" logscale="$8"
-  local img="$PLOTDIR/${test}_${key}.svg"
-  local gp="$PLOTDIR/${test}_${key}.gp"
-  local parts=() mp sl d dat title
+# Reduce pgbench's aggregate logs to "seconds value" pairs. Every worker thread
+# writes its own file — <prefix>.<pid> for the first and <prefix>.<pid>.<n> for
+# the rest — so the rows for one interval have to be combined across them:
+# transactions summed, mean latency weighted by transaction count, worst-case
+# latency taken as the worst any thread saw.
+#
+# Latencies in the log are microseconds. Interval timestamps are absolute Unix
+# seconds, so they are rebased onto the start of the run to match the fio
+# graphs, whose x axis is also elapsed-within-the-run.
+pgbench_series() { # <log prefix> <tps|lat|maxlat>
+  local prefix="$1" mode="$2"
+  local files=()
+  local f
+  for f in "$prefix".*; do [ -f "$f" ] && files+=("$f"); done
+  [ ${#files[@]} -eq 0 ] && return 0
 
-  for mp in "${USABLE[@]}"; do
-    sl="$(slug "$mp")"
-    for d in 0 1; do
-      dat="$PLOTDATA/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat"
-      # logscale doubles as the drop-non-positive flag: a zero is a real datum
-      # on a throughput plot (the backend stalled) and must stay, but it has no
-      # place on a log axis, where gnuplot would silently drop it anyway.
-      fio_series "$LOGDIR/${sl}_${test}${suffix}" "$d" "$mode" "$scale" "$logscale" >"$dat"
-      if [ ! -s "$dat" ]; then
-        rm -f "$dat"
-        continue
-      fi
-      if [ ${#USABLE[@]} -gt 1 ]; then
-        title="$mp ${DDIR_NAME[$d]}"
-      else
-        title="${DDIR_NAME[$d]}"
-      fi
-      parts+=("'$dat' using 1:2 with lines lw 2 title '$title'")
-    done
-  done
+  awk -v mode="$mode" -v ivl="$PGBENCH_AGG_INTERVAL" '
+    {
+      t = $1
+      tx[t] += $2
+      lat[t] += $3
+      if ($6 + 0 > mx[t]) mx[t] = $6 + 0
+      if (lo == "" || t < lo) lo = t
+      if (hi == "" || t > hi) hi = t
+    }
+    END {
+      n = 0
+      for (t in tx) n++
+      # The first and last intervals are partial — the run started and stopped
+      # partway through a second — so both read as a dip that is an artefact of
+      # the clock rather than the storage. Dropped, unless the run was so short
+      # that dropping them would leave nothing.
+      trim = (n >= 3)
+      for (t in tx) {
+        if (trim && (t == lo || t == hi)) continue
+        if (tx[t] <= 0) continue
+        if (mode == "tps") v = tx[t] / ivl
+        else if (mode == "lat") v = lat[t] / tx[t] / 1000
+        else v = mx[t] / 1000
+        printf "%.3f %.6f\n", t - lo, v
+      }
+    }' "${files[@]}" | sort -n
+}
+
+# The gnuplot half of a chart, shared by the fio and pgbench plots so there is
+# one place where the terminal, the axes and the legend are decided. Each part
+# is a complete gnuplot `plot` element. Returns non-zero if given nothing.
+render_plot() { # <img> <gp> <title> <xlabel> <ylabel> <logscale> <part>...
+  local img="$1" gp="$2" desc="$3" xlabel="$4" ylabel="$5" logscale="$6"
+  shift 6
+  local parts=("$@")
 
   [ ${#parts[@]} -eq 0 ] && return 1
 
@@ -625,8 +918,8 @@ plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <
     # then disappears against a dark-mode page.
     echo "set terminal svg noenhanced size 1100,$height font 'sans-serif,10' background rgb 'white'"
     echo "set output '$img'"
-    echo "set title '$desc - $test'"
-    echo "set xlabel 'elapsed within the fio run (s)'"
+    echo "set title '$desc'"
+    echo "set xlabel '$xlabel'"
     echo "set ylabel '$ylabel'"
     echo "set grid xtics ytics lc rgb '#c8c8c8'"
     echo "set key below maxcols 1"
@@ -646,6 +939,64 @@ plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <
   [ $rc -eq 0 ] && [ -s "$img" ]
 }
 
+# One SVG for one (test, metric), overlaying every mount and direction that
+# produced samples. Returns non-zero if there was nothing to draw.
+plot_metric() { # <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <logscale>
+  local test="$1" suffix="$2" key="$3" mode="$4" scale="$5"
+  local ylabel="$6" desc="$7" logscale="$8"
+  local parts=() mp sl d dat title
+
+  for mp in "${USABLE[@]}"; do
+    sl="$(slug "$mp")"
+    for d in 0 1; do
+      dat="$PLOTDATA/${sl}_${test}_${key}_${DDIR_NAME[$d]}.dat"
+      # logscale doubles as the drop-non-positive flag: a zero is a real datum
+      # on a throughput plot (the backend stalled) and must stay, but it has no
+      # place on a log axis, where gnuplot would silently drop it anyway.
+      fio_series "$LOGDIR/${sl}_${test}${suffix}" "$d" "$mode" "$scale" "$logscale" >"$dat"
+      if [ ! -s "$dat" ]; then
+        rm -f "$dat"
+        continue
+      fi
+      if [ ${#USABLE[@]} -gt 1 ]; then
+        title="$mp ${DDIR_NAME[$d]}"
+      else
+        title="${DDIR_NAME[$d]}"
+      fi
+      parts+=("'$dat' using 1:2 with lines lw 2 title '$title'")
+    done
+  done
+
+  render_plot "$PLOTDIR/${test}_${key}.svg" "$PLOTDIR/${test}_${key}.gp" \
+    "$desc - $test" "elapsed within the fio run (s)" "$ylabel" "$logscale" \
+    "${parts[@]}"
+}
+
+# The pgbench counterpart: one metric, every mount on the same axes. There is
+# no read/write split here — a TPC-B transaction is both.
+plot_pgbench() { # <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
+  local key="$1" mode="$2" ylabel="$3" desc="$4" logscale="$5"
+  local parts=() mp sl dat title
+
+  for mp in "${USABLE[@]}"; do
+    sl="$(slug "$mp")"
+    dat="$PLOTDATA/${sl}_pgbench_${key}.dat"
+    pgbench_series "$LOGDIR/pgbench_${sl}" "$mode" >"$dat"
+    if [ ! -s "$dat" ]; then
+      rm -f "$dat"
+      continue
+    fi
+    if [ ${#USABLE[@]} -gt 1 ]; then title="$mp"; else title="pgbench"; fi
+    parts+=("'$dat' using 1:2 with lines lw 2 title '$title'")
+  done
+
+  render_plot "$PLOTDIR/pgbench_${key}.svg" "$PLOTDIR/pgbench_${key}.gp" \
+    "$desc - pgbench" "elapsed within the pgbench run (s)" "$ylabel" "$logscale" \
+    "${parts[@]}"
+}
+
+pgbench_graphed=0
+
 if [ "$have_gnuplot" = 1 ]; then
   log "Drawing graphs"
   for t in "${FIO_TESTS[@]}"; do
@@ -659,6 +1010,19 @@ if [ "$have_gnuplot" = 1 ]; then
       "Completion latency over time" 1 && drawn=1
     if [ $drawn -eq 1 ]; then info "$t"; else info "$t — no samples, skipped"; fi
   done
+
+  if [ "$have_pgbench" = 1 ]; then
+    drawn=0
+    plot_pgbench tps tps "transactions/s" "Transaction rate over time" 0 && drawn=1
+    plot_pgbench lat lat "mean latency (ms)" "Mean transaction latency over time" 1 && drawn=1
+    # Worst case rather than mean, because the mean hides exactly what storage
+    # does to a database: a checkpoint or an fsync stall shows up as one
+    # interval where the slowest transaction took a hundred times the average.
+    plot_pgbench maxlat maxlat "worst latency (ms)" \
+      "Worst transaction latency over time" 1 && drawn=1
+    pgbench_graphed=$drawn
+    if [ $drawn -eq 1 ]; then info "pgbench"; else info "pgbench — no samples, skipped"; fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -730,6 +1094,7 @@ log "Writing report"
 | fio runtime per job   | ${FIO_RUNTIME}s |
 | fio ioengine          | ${IOENGINE} |
 | fio log sample window | ${LOG_AVG_MSEC}ms |
+| pgbench               | $([ "$have_pgbench" = 1 ] && echo "scale ${PGBENCH_SCALE}, ${PGBENCH_CLIENTS} clients, ${PGBENCH_JOBS} threads, ${PGBENCH_TIME}s" || echo "not run") |
 
 ## Reading these numbers
 
@@ -738,7 +1103,8 @@ log "Writing report"
 * What each fio job measures, and the exact command it ran, is in [fio tests](#fio-tests) — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
 * The \`dd_write_urandom\` figure is **CPU-bound in most environments** — \`/dev/urandom\` generation, not the disk, is usually the limiting factor. Treat it as a check on how the backend handles incompressible data (relevant if it does inline compression or dedup), not as a throughput measurement.
 * \`dd_read_direct\` bypasses the page cache. If it appears as \`dd_read_cached\` instead, the filesystem rejected O_DIRECT and that number is inflated by RAM caching.
-* If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\`.
+* If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
+* dd and fio measure the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
 * The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. That is what the [time series](#over-time) section is for.
 
@@ -818,6 +1184,59 @@ MDEOF
 
   csv_table "$FIO_CSV"
 
+  # ---- pgbench ----------------------------------------------------------
+  echo
+  echo "## pgbench"
+  echo
+  if [ "$have_pgbench" = 1 ]; then
+    cat <<EOF
+Everything above measures the storage. This measures a database on top of it,
+which is the only number here an application would recognise.
+
+A throwaway PostgreSQL ${PG_VERSION} cluster is created on each mount with
+\`initdb\`, loaded to scale ${PGBENCH_SCALE} (about $((PGBENCH_SCALE * 16)) MiB of table data before
+indexes), and then driven for ${PGBENCH_TIME}s through pgbench's built-in TPC-B-like
+workload at ${PGBENCH_CLIENTS} concurrent clients across ${PGBENCH_JOBS} threads. Each transaction is
+a handful of small updates and an insert, committed — so every one of them
+costs a WAL write and an \`fsync\` before the client is told it succeeded.
+
+That commit path is why this tracks \`fsync_8k_qd1\` more closely than any other
+test here, and why the two can still disagree: postgres adds a WAL record, a
+heap and index page the checkpointer has to write back later, and a full-page
+image for the first write to each page after a checkpoint. Write amplification
+of several times the logical change is normal, and a backend that does well on
+raw \`fsync\` but badly here is usually one that copes with a steady trickle of
+small writes but not with the burst a checkpoint delivers.
+
+The cluster runs with \`fsync\`, \`synchronous_commit\` and \`full_page_writes\` all
+on, which are the defaults, stated so that what was measured is on the record.
+\`shared_buffers\` is left at its 128 MB default on purpose: a cluster large
+enough to cache the working set would be reporting the speed of RAM. The
+cluster is deleted after each mount.
+
+| Column | Meaning |
+| ------ | ------- |
+| \`init_s\` | seconds to load the data — bulk write throughput, as pgbench timed it |
+| \`tps\` | transactions per second over the timed run, excluding connection setup |
+| \`latency_avg_ms\` | mean time to commit one transaction |
+| \`failed\` | transactions rolled back; anything but 0 makes \`tps\` suspect |
+
+EOF
+    csv_table "$PG_CSV"
+  else
+    cat <<'EOF'
+Not run. The suite normally finishes with a real workload — a throwaway
+PostgreSQL cluster per mount, driven through pgbench's TPC-B-like transaction —
+because it is the only number here that carries a WAL, a checkpointer and a
+page cache rather than measuring the storage directly.
+
+It was skipped: either `PGBENCH=0` was set, postgres is not in this image, the
+benchmark is running as root (postgres refuses to), or the uid it runs as has
+no `/etc/passwd` entry, which postgres needs to resolve its own identity. The
+run summary printed at the end says which.
+EOF
+  fi
+
   # ---- time series ------------------------------------------------------
   cat <<EOF
 
@@ -861,6 +1280,28 @@ EOF
     done
   done
 
+  if [ "$pgbench_graphed" = 1 ]; then
+    graphed=1
+    echo "### pgbench"
+    echo
+    cat <<EOF
+pgbench aggregates its own log into fixed intervals and one second is the
+finest it will accept, so these are coarser than the fio graphs above — a stall
+shorter than a second is inside a sample rather than visible as one. The worst
+latency chart is the one to read for that: it plots the slowest single
+transaction in each interval, so a checkpoint or an fsync stall that the mean
+absorbs still shows as a spike.
+
+EOF
+    for spec in "tps:Transaction rate" "lat:Mean latency" "maxlat:Worst latency"; do
+      key="${spec%%:*}"
+      cap="${spec#*:}"
+      [ -f "$PLOTDIR/pgbench_${key}.svg" ] || continue
+      echo "![${cap} — pgbench](graphs/pgbench_${key}.svg)"
+      echo
+    done
+  fi
+
   if [ "$graphed" = 0 ]; then
     if [ "$have_gnuplot" = 1 ]; then
       echo "No time-series samples were produced — every fio job failed, or the"
@@ -881,11 +1322,21 @@ test per mount. The fio files are terse version 3 records — useful if you want
 latency percentiles or bandwidth min/max, which are not carried into the CSV
 above.
 
+`raw/pgbench_<mount>.txt` holds everything pgbench and initdb printed, and
+`raw/pgbench_<mount>_server.log` the postgres server log for that mount —
+checkpoint and autovacuum activity land there, which is usually where an
+unexplained dip in the transaction rate is explained.
+
 `fio-logs/` holds fio's own time-series logs, named
 `<mount>_<test>_{bw,iops,lat,slat,clat}.log`, in fio's usual
 `time_ms, value, ddir, blocksize, offset` format (`ddir` 0 = read, 1 = write).
-Bandwidth is KiB/s, latency is nanoseconds. These are the unprocessed inputs to
-the graphs above, and they are in fio's standard log format, so `fio2gnuplot`
+Bandwidth is KiB/s, latency is nanoseconds. Alongside them are pgbench's
+aggregate logs, `pgbench_<mount>.<pid>[.<thread>]`, one row per second per
+thread as `interval_start num_transactions sum_latency sum_latency_2
+min_latency max_latency` with latencies in microseconds.
+
+These are the unprocessed inputs to
+the graphs above, and the fio ones are in fio's standard log format, so `fio2gnuplot`
 and `fiologparser.py` will read them if you want to re-plot them differently.
 Neither ships in this image — both are Python, and CPython is most of what a
 benchmark image would otherwise carry.
@@ -1163,6 +1614,7 @@ echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
 echo "  CSVs     : $DD_CSV"
 echo "             $FIO_CSV"
+[ "$have_pgbench" = 1 ] && echo "             $PG_CSV"
 if [ "$have_gnuplot" = 1 ]; then
   echo "  Graphs   : $PLOTDIR/"
 fi

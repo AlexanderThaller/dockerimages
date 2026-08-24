@@ -88,6 +88,46 @@ let
   # `-e table` is what makes the results CSVs render as tables; it is a GFM
   # extension rather than CommonMark, so plain `cmark` will not do.
   cmark-gfm = pkgs.cmark-gfm;
+
+  # The non-synthetic half of the benchmark. pgbench ships inside the main
+  # postgresql output, so this one package covers initdb, the server and the
+  # client the script drives.
+  #
+  # It is easily the largest thing in the image and every flag below is off
+  # because a throwaway cluster on a unix socket, created and dropped inside a
+  # single run of this script, cannot reach the feature:
+  #
+  #   gss       Kerberos. Pulls krb5. Nothing authenticates; initdb uses trust.
+  #   icu       collation provider. 84 MiB of closure for locale-aware sorting
+  #             that the script opts out of anyway — initdb runs with
+  #             --locale=C, and the C locale is handled by libc.
+  #   pam       PAM auth. Pulls linux-pam, and behind it Berkeley DB and
+  #             systemd's libraries — ~100 MiB for a login path with no login.
+  #   systemd   sd_notify readiness. The script waits with `pg_ctl -w`.
+  #   jit       LLVM expression JIT. pgbench's transaction is five short
+  #             statements; there is nothing to compile, and postgres would not
+  #             reach its jit_above_cost threshold on any of them.
+  #   curl, ldap, nls
+  #             OAuth validation, directory auth, translated messages.
+  #
+  # Stock this is 144 MiB of closure; as configured it is 92.7 MiB, of which
+  # ~43 MiB is new to the image — the rest is glibc and friends that coreutils
+  # already brought. readline is deliberately *kept*, even though nothing here
+  # runs psql interactively: dropping it saves 4.3 MiB and takes line editing
+  # out of the psql you get from `just shell`, which is a bad trade.
+  #
+  # If a future change needs a real authentication method, a non-C collation or
+  # a network listener, the flag it needs is here rather than somewhere else.
+  postgresql = pkgs.postgresql.override {
+    gssSupport = false;
+    icuSupport = false;
+    pamSupport = false;
+    systemdSupport = false;
+    jitSupport = false;
+    curlSupport = false;
+    ldapSupport = false;
+    nlsSupport = false;
+  };
 in
 {
   # Everything storage-bench.sh shells out to, plus the tool that renders its
@@ -106,6 +146,7 @@ in
     fio
     gnuplot
     cmark-gfm
+    postgresql
   ] ++ (with pkgs; [
     bashInteractive
     coreutils

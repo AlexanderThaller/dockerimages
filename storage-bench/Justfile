@@ -8,7 +8,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just run /mnt/ceph` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r1"
+tag := "2026-08-24-r2"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -54,7 +54,8 @@ run +hostpaths: load
     done
     # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
     # `RUNDIR=before-upgrade just run /mnt/ceph`.
-    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC RUNDIR; do
+    for v in ORDER SETTLE DD_ZERO_MB DD_RAND_MB FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
+             PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged
@@ -64,8 +65,14 @@ run +hostpaths: load
     # OUTBASE, not OUTDIR: the mount is the base, and the script puts each run
     # in its own directory underneath it, so a second run does not overwrite
     # the first.
+    # --shm-size: postgres puts its dynamic shared memory segments in /dev/shm,
+    # which both engines default to 64 MB. A parallel index build during the
+    # pgbench load can ask for up to maintenance_work_mem and fail with "could
+    # not resize shared memory segment" when it cannot get it. It survives 64 MB
+    # at the default scale, but the margin is not worth the failure mode.
     {{ engine }} run --rm \
         --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        --shm-size=256m \
         -v {{ results }}:/out -e OUTBASE=/out \
         "${vols[@]}" "${envs[@]}" {{ run_args }} \
         {{ image }}:{{ tag }} "${targets[@]}"
@@ -75,20 +82,25 @@ run +hostpaths: load
 shell: load
     {{ engine }} run --rm -it --entrypoint bash {{ image }}:{{ tag }}
 
-# Measures nothing useful — it exercises dd, fio, the awk/sed parsing and the
-# report generator against a container-local tmpfs. Empty RUNDIR because a
-# throwaway check wants its output in one predictable place, not in a new
-# timestamped directory on every invocation.
+# Measures nothing useful — it exercises dd, fio, pgbench, the awk/sed parsing
+# and the report generator against a container-local tmpfs. Empty RUNDIR because
+# a throwaway check wants its output in one predictable place, not in a new
+# timestamped directory on every invocation. pgbench is pinned to scale 5 here
+# rather than the default 100: the tmpfs is RAM, and 1.6 GB of it is not what a
+# smoke test should cost.
 
 # Tiny end-to-end run to prove the image works.
 smoke: load
     mkdir -p {{ results }}/smoke
     {{ engine }} run --rm \
         --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        --shm-size=256m \
         --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
         -v {{ results }}/smoke:/out -e OUTBASE=/out -e RUNDIR= \
         -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
-        -e FIO_SIZE=64M -e FIO_RUNTIME=2 {{ run_args }} \
+        -e FIO_SIZE=64M -e FIO_RUNTIME=2 \
+        -e PGBENCH_SCALE=5 -e PGBENCH_CLIENTS=4 -e PGBENCH_JOBS=2 -e PGBENCH_TIME=5 \
+        {{ run_args }} \
         {{ image }}:{{ tag }} /data/a /data/b
     @ls -l {{ results }}/smoke
 
