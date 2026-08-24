@@ -949,11 +949,18 @@ render_plot() { # <img> <gp> <title> <xlabel> <ylabel> <logscale> <part>...
 
   [ ${#parts[@]} -eq 0 ] && return 1
 
-  local plotline
-  plotline="$(
-    IFS=,
-    printf '%s' "${parts[*]}"
-  )"
+  # One element per line, joined with gnuplot's backslash continuation, rather
+  # than one long line. gnuplot stops parsing a command line somewhere past 2 KB
+  # — a plot of six series whose titles and data paths both carry a deep mount
+  # path reaches that — and the failure is a syntax error pointing at the
+  # truncation, having already written a partial SVG, so it does not even look
+  # like a length problem. It also makes the .gp files readable, which matters
+  # because the report invites people to re-run them.
+  local plotline="" p sep=""
+  for p in "${parts[@]}"; do
+    plotline="${plotline}${sep}${p}"
+    sep=", \\"$'\n'"     "
+  done
 
   # The legend sits below the plot, one entry per row, and the canvas grows to
   # make room for the rows. It used to sit outside right, which gnuplot sizes by
@@ -1050,16 +1057,27 @@ PLOT_COLORS=('#9400d3' '#009e73' '#56b4e9' '#e69f00' '#f0e442' '#0072b2' '#e51e1
 # reads as one series rather than two. A wide band means the storage did not
 # do the same thing twice, which is the reason for running it more than once.
 PLOT_PARTS=()
-plot_parts() { # <datfile> <title> <pass id> <colour index>
-  local dat="$1" title="$2" rid="$3" ci="$4"
+plot_parts() { # <datfile> <title> <band|dash|line> <colour index> [dash index]
+  local dat="$1" title="$2" style="$3" ci="$4" di="${5:-0}"
   local color="${PLOT_COLORS[$((ci % ${#PLOT_COLORS[@]}))]}"
   PLOT_PARTS=()
-  if [ "$rid" = agg ]; then
+  case "$style" in
+  band)
     PLOT_PARTS+=("'$dat' using 1:3:4 with filledcurves fc rgb '$color' fs transparent solid 0.18 notitle")
     PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 lc rgb '$color' title '$title'")
-  else
+    ;;
+  dash)
+    # One colour per series, one dash pattern per pass, so the same series in
+    # different passes stays visibly the same series. Colouring by pass instead
+    # would run out of distinguishable colours as soon as there is more than one
+    # mount, and would make two unrelated lines look related.
+    # gnuplot's dashtypes: 1 solid, 2 dashed, 3 dotted, 4 dash-dot, 5 dash-dot-dot.
+    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 lc rgb '$color' dt $((di % 5 + 1)) title '$title'")
+    ;;
+  *)
     PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 title '$title'")
-  fi
+    ;;
+  esac
 }
 
 # One SVG for one (test, metric), overlaying every mount and direction that
@@ -1071,7 +1089,8 @@ plot_parts() { # <datfile> <title> <pass id> <colour index>
 plot_metric() { # <pass id> <test> <log-suffix> <key> <sum|avg> <scale> <ylabel> <title> <logscale>
   local rid="$1" test="$2" suffix="$3" key="$4" mode="$5" scale="$6"
   local ylabel="$7" desc="$8" logscale="$9"
-  local parts=() mp sl d dat title ci=0 srcs outdir logdir datdir
+  local parts=() mp sl d dat title ci=0 srcs outdir logdir datdir style=line
+  [ "$rid" = agg ] && style=band
 
   # Derived from the pass being drawn, not read from the LOGDIR/PLOTDATA
   # globals: by the time the graphs are drawn those still point at whichever
@@ -1109,7 +1128,7 @@ plot_metric() { # <pass id> <test> <log-suffix> <key> <sum|avg> <scale> <ylabel>
         rm -f "$dat"
         continue
       fi
-      plot_parts "$dat" "$title" "$rid" "$ci"
+      plot_parts "$dat" "$title" "$style" "$ci"
       parts+=("${PLOT_PARTS[@]}")
       ci=$((ci + 1))
     done
@@ -1124,7 +1143,8 @@ plot_metric() { # <pass id> <test> <log-suffix> <key> <sum|avg> <scale> <ylabel>
 # no read/write split here — a TPC-B transaction is both.
 plot_pgbench() { # <pass id> <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
   local rid="$1" key="$2" mode="$3" ylabel="$4" desc="$5" logscale="$6"
-  local parts=() mp sl dat title ci=0 srcs outdir logdir datdir
+  local parts=() mp sl dat title ci=0 srcs outdir logdir datdir style=line
+  [ "$rid" = agg ] && style=band
 
   # Same reason as plot_metric: the pass being drawn, not whichever ran last.
   if [ "$rid" = agg ]; then outdir="$PLOTDIR/aggregate"; else outdir="$PLOTDIR/$rid"; fi
@@ -1155,7 +1175,7 @@ plot_pgbench() { # <pass id> <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
       rm -f "$dat"
       continue
     fi
-    plot_parts "$dat" "$title" "$rid" "$ci"
+    plot_parts "$dat" "$title" "$style" "$ci"
     parts+=("${PLOT_PARTS[@]}")
     ci=$((ci + 1))
   done
@@ -1165,7 +1185,63 @@ plot_pgbench() { # <pass id> <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
     "${parts[@]}"
 }
 
+# Every pass on one set of axes, unaggregated. The aggregate answers "what does
+# this storage do"; this answers "did it do the same thing every time", and
+# unlike the band it names the pass that disagreed — a first pass that was slow
+# because a cache was cold looks nothing like one pass in three stalling at
+# random, and the band renders both as the same width.
+#
+# Reads the per-pass .dat files the pass loop already wrote, so it has to run
+# after them.
+plot_compare() { # <base> <key> <ylabel> <title> <logscale>
+  local base="$1" key="$2" ylabel="$3" desc="$4" logscale="$5"
+  local parts=() mp sl d r dat title ci=0 di drew xlabel
+  local outdir="$PLOTDIR/compare"
+  mkdir -p "$outdir"
+
+  local dirs=(0 1)
+  xlabel="elapsed within the fio run (s)"
+  if [ "$base" = pgbench ]; then
+    dirs=(-)
+    xlabel="elapsed within the pgbench run (s)"
+  fi
+
+  for mp in "${USABLE[@]}"; do
+    sl="$(slug "$mp")"
+    for d in "${dirs[@]}"; do
+      di=0
+      drew=0
+      for r in "${RUN_IDS[@]}"; do
+        if [ "$base" = pgbench ]; then
+          dat="$PLOTDIR/data/$r/${sl}_pgbench_${key}.dat"
+          title="$r"
+        else
+          dat="$PLOTDIR/data/$r/${sl}_${base}_${key}_${DDIR_NAME[$d]}.dat"
+          title="$r ${DDIR_NAME[$d]}"
+        fi
+        [ ${#USABLE[@]} -gt 1 ] && title="$title $mp"
+
+        # The dash index still advances for a pass that produced nothing, so a
+        # pass keeps the same dash pattern in every chart it appears in.
+        if [ -s "$dat" ]; then
+          plot_parts "$dat" "$title" dash "$ci" "$di"
+          parts+=("${PLOT_PARTS[@]}")
+          drew=1
+        fi
+        di=$((di + 1))
+      done
+      # Only a series that drew something consumes a colour, so the colours stay
+      # dense rather than leaving gaps for write-only tests.
+      [ $drew -eq 1 ] && ci=$((ci + 1))
+    done
+  done
+
+  render_plot "$outdir/${base}_${key}.svg" "$outdir/${base}_${key}.gp" \
+    "$desc - $base, every pass" "$xlabel" "$ylabel" "$logscale" "${parts[@]}"
+}
+
 pgbench_graphed=0
+cmp_graphed=0
 agg_graphed=0
 
 if [ "$have_gnuplot" = 1 ]; then
@@ -1208,6 +1284,31 @@ if [ "$have_gnuplot" = 1 ]; then
     [ "$rid" = agg ] && [ $drawn -eq 1 ] && agg_graphed=1
     if [ $drawn -eq 1 ]; then info "  pgbench"; else info "  pgbench — no samples, skipped"; fi
   done
+
+  # Last, because it reads what every pass above wrote.
+  if [ "$REPEATS" -gt 1 ]; then
+    info "every pass on one axis:"
+    for t in "${FIO_TESTS[@]}"; do
+      drawn=0
+      plot_compare "$t" iops "IOPS" "IOPS over time" 0 && drawn=1
+      plot_compare "$t" bw "bandwidth (MiB/s)" "Bandwidth over time" 0 && drawn=1
+      plot_compare "$t" clat "completion latency (us)" \
+        "Completion latency over time" 1 && drawn=1
+      [ $drawn -eq 1 ] && cmp_graphed=1
+      if [ $drawn -eq 1 ]; then info "  $t"; else info "  $t — no samples, skipped"; fi
+    done
+
+    if [ "$have_pgbench" = 1 ]; then
+      drawn=0
+      plot_compare pgbench tps "transactions/s" "Transaction rate over time" 0 && drawn=1
+      plot_compare pgbench lat "mean latency (ms)" \
+        "Mean transaction latency over time" 1 && drawn=1
+      plot_compare pgbench maxlat "worst latency (ms)" \
+        "Worst transaction latency over time" 1 && drawn=1
+      [ $drawn -eq 1 ] && cmp_graphed=1
+      if [ $drawn -eq 1 ]; then info "  pgbench"; else info "  pgbench — no samples, skipped"; fi
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1279,7 +1380,11 @@ fi
 emit_graphs() { # <graph basename> <caption subject> [pass id]
   local base="$1" subject="$2" rid="${3:-$HEADLINE_GRAPHS}" suffix key cap spec
   [ -n "$rid" ] || return 0
-  if [ "$rid" = "$HEADLINE_GRAPHS" ]; then suffix="$HEADLINE_SUFFIX"; else suffix=" ($rid)"; fi
+  case "$rid" in
+  compare) suffix=" (all $REPEATS passes)" ;;
+  "$HEADLINE_GRAPHS") suffix="$HEADLINE_SUFFIX" ;;
+  *) suffix=" ($rid)" ;;
+  esac
 
   local specs=("iops:IOPS" "bw:Bandwidth" "clat:Completion latency")
   [ "$base" = pgbench ] &&
@@ -1518,6 +1623,28 @@ Each pass is a complete run of the suite, separated from the next by the same
 ${SETTLE}s cooldown that separates runs within a pass.
 
 EOF
+
+    if [ "$cmp_graphed" = 1 ]; then
+      cat <<'EOF'
+### Every pass on one axis
+
+Each chart here is one test with every pass drawn on it, unaggregated. The
+colour is the series — the mount, and the direction where a test does both —
+and the dash pattern is the pass, so the same series across passes stays
+recognisably the same series.
+
+This is the chart that says *which* pass disagreed, which the band on the
+aggregate cannot: a first pass slower than the rest because a cache was cold
+and one pass in three stalling at random produce the same width of band and
+mean very different things.
+
+EOF
+      for t in "${FIO_TESTS[@]}"; do
+        emit_graphs "$t" "$t" compare
+      done
+      [ "$pgbench_graphed" = 1 ] && emit_graphs pgbench pgbench compare
+    fi
+
     for rid in "${RUN_IDS[@]}"; do
       echo "### $rid"
       echo

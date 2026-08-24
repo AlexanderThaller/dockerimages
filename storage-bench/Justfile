@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-08-24-r5"
+tag := "2026-08-24-r6"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -143,7 +143,7 @@ smoke: load
         --tmpfs /data/a:uid=$(id -u) --tmpfs /data/b:uid=$(id -u) \
         -v {{ results }}/smoke:/out -e OUTBASE=/out -e RUNDIR= \
         -e SETTLE=0 -e DD_ZERO_MB=32 -e DD_RAND_MB=8 \
-        -e FIO_SIZE=64M -e FIO_RUNTIME=2 -e REPEATS=2 \
+        -e FIO_SIZE=64M -e FIO_RUNTIME=2 -e REPEATS=3 \
         -e PGBENCH_SCALE=5 -e PGBENCH_CLIENTS=4 -e PGBENCH_JOBS=2 -e PGBENCH_TIME=5 \
         {{ run_args }} \
         {{ image }}:{{ tag }} /data/a /data/b
