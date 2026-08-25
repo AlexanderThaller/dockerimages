@@ -96,7 +96,7 @@ _run-against imageref +hostpaths:
     # `RUNDIR=before-upgrade just run /mnt/ceph`.
     for v in ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
              PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME \
-             PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL RUNDIR; do
+             PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL ARCHIVE RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged

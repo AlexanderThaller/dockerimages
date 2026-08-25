@@ -31,6 +31,7 @@
 #   OUTBASE RUNDIR ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME
 #   IOENGINE LOG_AVG_MSEC PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS
 #   PGBENCH_TIME PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL PLOT RENDER
+#   ARCHIVE
 #
 # DD_ZERO_MB and DD_RAND_MB are gone with the dd tests they sized; see below.
 #
@@ -374,6 +375,10 @@ def load-config [ts: string]: nothing -> record {
 
   let cfg = {
     outdir: $outdir
+    # Kept so the archive step can tell a named run directory, which it can put
+    # the tarball beside, from an empty RUNDIR, where the run directory is
+    # OUTBASE itself and there is no beside.
+    rundir: $rundir
     order: (env-choice "ORDER" "by-mount" [by-mount by-test])
     repeats: (env-int "REPEATS" 3)
     # SETTLE alone may be zero: that is how the cooldown is turned off.
@@ -418,6 +423,9 @@ def load-config [ts: string]: nothing -> record {
     # Haskell binary several times the size of everything else in this image put
     # together, for output formats nobody was reading.
     render: (env-choice "RENDER" "html" [html none])
+    # Tar the finished run directory up, so what has to be copied off the
+    # machine that was measured is one file rather than a few thousand.
+    archive: ((env-str "ARCHIVE" "1") == "1")
   }
 
   # pgbench divides its clients between its threads and refuses the run outright
@@ -2395,9 +2403,41 @@ measured here. The passes are also plotted separately in
 
   cleanup $ctx
 
+  # A finished run is a few thousand files, and the machine it was measured on
+  # is usually not the one it gets read on, so it is tarred up as the last thing
+  # before the summary. The archive is written next to the run directory rather
+  # than inside it, so it does not have to exclude itself and so a second run's
+  # archive does not disappear into the first one's folder.
+  #
+  # With RUNDIR empty the run directory *is* OUTBASE and there is no "next to",
+  # so the archive goes inside and tar is handed the top-level entries by name.
+  # Excluding it from a walk of `.` is not enough: tar still stats the directory
+  # it is writing into, sees it change underneath itself, and exits 1 with "file
+  # changed as we read it", which is indistinguishable from a real failure.
+  let archive = (if $cfg.archive and (has-cmd "tar") {
+    log-section "Archiving results"
+    let spec = (if ($cfg.rundir | is-empty) {
+      let a = $"($cfg.outdir)/storage-bench-results.tar.gz"
+      let entries = (ls $cfg.outdir | get name | path basename | where {|e| $e != "storage-bench-results.tar.gz" })
+      { path: $a, args: ([-C $cfg.outdir] | append $entries) }
+    } else {
+      let base = ($cfg.outdir | path dirname)
+      { path: $"($base)/($cfg.rundir).tar.gz", args: [-C $base $cfg.rundir] }
+    })
+    let r = (^tar -czf $spec.path ...$spec.args | complete)
+    if $r.exit_code == 0 {
+      info $"($spec.path)"
+      $spec.path
+    } else {
+      info $"FAILED: ($r.stderr | str trim)"
+      ""
+    }
+  } else { "" })
+
   let last = (run-id-for $cfg.repeats)
   print ""
   print $"Done in ($elapsed)s."
+  if ($archive | is-not-empty) { print $"  Archive  : ($archive)" }
   print $"  Report   : ($md)"
   if ($html | is-not-empty) { print $"             ($html)" }
   print $"  CSVs     : ($fio_csv)"

@@ -66,6 +66,7 @@
 #   PGBENCH_MAX_WAL  postgres max_wal_size      (default 4GB)
 #   PLOT          1|0, draw the gnuplot graphs  (default 1)
 #   RENDER        html|none                     (default html)
+#   ARCHIVE       1|0, tar.gz the run directory  (default 1)
 #
 # fio measures the storage directly. pgbench measures what a real application
 # gets out of it: a throwaway PostgreSQL cluster is initialised on each mount in
@@ -155,6 +156,10 @@ PGBENCH_MODE="${PGBENCH_MODE:-prepared}"
 PGBENCH_MAX_WAL="${PGBENCH_MAX_WAL:-4GB}"
 PLOT="${PLOT:-1}"
 RENDER="${RENDER:-html}"
+
+# Tar the finished run directory up, so what has to be copied off the machine
+# that was measured is one file rather than a few thousand.
+ARCHIVE="${ARCHIVE:-1}"
 
 # pgbench aggregates its own log into fixed intervals and one second is the
 # finest it accepts, so unlike LOG_AVG_MSEC this is not a tunable — it is the
@@ -2114,8 +2119,58 @@ if [ "$RENDER" = "html" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Archive
+#
+# A finished run is a few thousand files, and the machine it was measured on is
+# usually not the one it gets read on, so it is tarred up as the last thing
+# before the summary. The archive is written next to the run directory rather
+# than inside it, so it does not have to exclude itself and so a second run's
+# archive does not disappear into the first one's folder.
+#
+# With RUNDIR empty the run directory *is* OUTBASE and there is no "next to",
+# so the archive goes inside and excludes itself by name.
+# ---------------------------------------------------------------------------
+ARCHIVE_PATH=""
+
+if [ "$ARCHIVE" = "1" ]; then
+  log "Archiving results"
+  if ! command -v tar >/dev/null 2>&1; then
+    info "tar not found in PATH — skipping"
+    MISSING+=("tar — the results were not archived")
+  else
+    if [ -n "$RUNDIR" ]; then
+      archive="$OUTBASE/${RUNDIR}.tar.gz"
+      tar_args=(-C "$OUTBASE" "$RUNDIR")
+    else
+      # The archive has to live in the directory it is archiving, so tar is
+      # given the top-level entries by name rather than `.`. Excluding it from a
+      # walk of `.` is not enough: tar still stats the directory it is writing
+      # into, sees it change underneath itself, and exits 1 with "file changed
+      # as we read it" — which is indistinguishable from a real failure.
+      archive="$OUTDIR/storage-bench-results.tar.gz"
+      tar_args=(-C "$OUTDIR")
+      for e in "$OUTDIR"/*; do
+        [ -e "$e" ] || continue
+        [ "$e" = "$archive" ] && continue
+        tar_args+=("${e##*/}")
+      done
+    fi
+
+    if tar -czf "$archive" "${tar_args[@]}" 2>"$RAWDIR/tar.log"; then
+      ARCHIVE_PATH="$archive"
+      info "$(du -h "$archive" | cut -f1)  $archive"
+    else
+      info "FAILED (see $RAWDIR/tar.log)"
+      MISSING+=("tar — the results were not archived")
+      rm -f "$archive"
+    fi
+  fi
+fi
+
 echo
 echo "Done in ${ELAPSED}s."
+[ -n "$ARCHIVE_PATH" ] && echo "  Archive  : $ARCHIVE_PATH"
 echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
 echo "  CSVs     : $FIO_CSV"

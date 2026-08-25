@@ -71,6 +71,7 @@ Defaults below are what the script uses, and are the same in
 | `OUTBASE` | `/tmp` | Directory the run directory is created in. Under `just`, this is the mounted `bench-results/`. |
 | `RUNDIR` | `bench-results-<timestamp>` | The per-run directory inside `OUTBASE`. Set it to a name to label a run (`RUNDIR=before-upgrade`); set it **empty** to write straight into `OUTBASE` rather than a subdirectory. |
 | `OUTDIR` | — | Deprecated alias read as a fallback for `OUTBASE`. `OUTDIR=/out` means `/out/bench-results-<timestamp>`. |
+| `ARCHIVE` | `1` | Tar the finished run directory into `<RUNDIR>.tar.gz`, written beside it, so one file has to be copied off the machine that was measured. With `RUNDIR` empty the archive goes inside as `storage-bench-results.tar.gz`. `0` disables. |
 
 ### Run structure
 
@@ -167,9 +168,10 @@ environment.
 
 ## Output layout
 
-One directory per run, under `OUTBASE`:
+One directory per run, under `OUTBASE`, plus a tarball of it beside it:
 
 ```
+bench-results-<timestamp>.tar.gz     the whole directory below, in one file
 bench-results-<timestamp>/
 ├── storage-benchmark-report.md      the report, readable as-is
 ├── storage-benchmark-report.html    the same, self-contained, graphs inlined

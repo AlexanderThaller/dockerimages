@@ -154,5 +154,13 @@ in
     gawk
     gnugrep
     gnused
+
+    # A finished run is a directory of a few thousand files — per-pass fio logs,
+    # reduced series, one SVG per chart per pass — and getting it off the
+    # machine that was measured usually means scp or `kubectl cp`. Both are far
+    # happier with one file, so the run is tarred up at the end. Together they
+    # add 4.7 MiB to the closure and neither pulls anything but libc.
+    gnutar
+    gzip
   ]);
 }
