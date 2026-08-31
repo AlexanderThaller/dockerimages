@@ -1,0 +1,219 @@
+# storage-chaos container image
+#
+#   just                          build the image and load it into the engine
+#   just dry openshift-storage    resolve and print the plan, delete nothing
+#   just chaos openshift-storage  kill pods with the published image
+#   just run openshift-storage    build the image first, then do that
+#
+# `chaos` is the one to reach for from a laptop: it pulls the published image
+# and needs nothing but a container engine and a kubeconfig that can delete
+# pods. `run` rebuilds from this checkout first, which needs Nix, and is what
+# you want while changing the script. Both put their reports in chaos-results/.
+#
+# In cluster, where it belongs beside a storage-bench Job, use the manifests:
+#   just deploy openshift-storage
+#
+# Script tunables are read from the environment and forwarded into the
+# container, so `MODE=deterministic INTERVAL=120 just chaos portworx` works.
+
+image := "storage-chaos"
+tag := "2026-08-31-r1"
+
+# Where `just push` sends the image when no registry is given on the command
+# line. `just push quay.io/someone` still overrides it for a one-off.
+default_registry := "docker.io/athallerde"
+
+# Where `just chaos` pulls from. REGISTRY overrides it for a one-off, e.g.
+# `REGISTRY=quay.io/someone just chaos openshift-storage`.
+registry := env("REGISTRY", default_registry)
+
+# docker or podman; override with CONTAINER_ENGINE=podman
+engine := env("CONTAINER_ENGINE", "docker")
+
+# kubectl or oc, for the deploy/undeploy recipes.
+kubectl := env("KUBECTL_BIN", "kubectl")
+
+# Extra flags for `run`/`chaos`, e.g. RUN_ARGS="--network host"
+run_args := env("RUN_ARGS", "")
+
+# The kubeconfig handed to the container. Whatever KUBECONFIG points at, or the
+# usual place if it points nowhere.
+kubeconfig := env("KUBECONFIG", env("HOME") / ".kube/config")
+
+# Where `just chaos` and `just run` drop their reports on the host, one
+# timestamped directory per run.
+results := justfile_directory() / "chaos-results"
+
+_default: help
+
+# List the available recipes.
+help:
+    @just --list
+
+# Build the image tarball with Nix (-> ./result).
+build:
+    nix-build --argstr name {{ image }} --argstr tag {{ tag }}
+
+# Build, then load the image into the local container engine.
+load: build
+    {{ engine }} load < result
+
+# Pulled every time so a stale local copy of the tag cannot silently be what
+# ran against the cluster.
+
+# Kill pods in the given namespaces using the published image (no build, no Nix).
+chaos +namespaces:
+    {{ engine }} pull {{ registry }}/{{ image }}:{{ tag }}
+    @just _run-against {{ registry }}/{{ image }}:{{ tag }} {{ namespaces }}
+
+# Build the image from this checkout, then kill pods with it.
+run +namespaces: load
+    @just _run-against {{ image }}:{{ tag }} {{ namespaces }}
+
+# What to run first, every time, against a cluster nobody has pointed this at
+# before: it resolves the pods, writes the plan and the report, and deletes
+# nothing. The plan it prints is exactly the order a real run would use.
+
+# Resolve the plan and report on it without deleting anything.
+dry +namespaces:
+    @DRY_RUN=1 just chaos {{ namespaces }}
+
+# The body shared by `chaos` and `run`; they differ only in where the image
+# came from.
+_run-against imageref +namespaces:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -r "{{ kubeconfig }}" ] || { echo "no readable kubeconfig at {{ kubeconfig }}" >&2; exit 1; }
+    mkdir -p {{ results }}
+    envs=()
+    # RUNDIR is forwarded so a run can be named rather than timestamped, e.g.
+    # `RUNDIR=osd-kills just chaos openshift-storage`.
+    for v in SELECTOR INCLUDE EXCLUDE MODE SEED ITERATIONS DURATION INTERVAL \
+             START_DELAY BATCH KILL_MODE GRACE WAIT_READY READY_TIMEOUT POLL \
+             MIN_READY DRY_RUN REPORT RUNDIR; do
+        if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
+    done
+    # As the calling user, both because the script needs no privilege and so
+    # the reports are not left root-owned. HOME must be somewhere writable:
+    # kubectl puts its discovery cache there.
+    #
+    # OUTBASE, not OUTDIR: the mount is the base, and the script puts each run
+    # in its own directory underneath it, so a second run does not overwrite
+    # the first.
+    #
+    # The kubeconfig goes in read-only under a path of its own rather than at
+    # ~/.kube: a config with `exec` credential plugins in it (oidc, aws, gke)
+    # names binaries this image does not have, and mounting it read-only at
+    # least fails honestly instead of leaving a rewritten token behind.
+    {{ engine }} run --rm -it \
+        --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        -v "$(realpath {{ kubeconfig }}):/kube/config:ro" -e KUBECONFIG=/kube/config \
+        -v {{ results }}:/out -e OUTBASE=/out \
+        "${envs[@]}" {{ run_args }} \
+        {{ imageref }} {{ namespaces }}
+    echo "Reports in {{ results }}/ (one directory per run)"
+
+# Interactive shell in the image.
+shell: load
+    {{ engine }} run --rm -it --entrypoint bash {{ image }}:{{ tag }}
+
+# In cluster, beside the benchmark rather than across the internet from it: a
+# ServiceAccount with delete-pods in the target namespace, and a Job that runs
+# the image. NAMESPACE is where the Job itself lives; the arguments are the
+# namespaces it is allowed to kill in, and it needs a RoleBinding in each.
+#
+#   just deploy openshift-storage
+#   MODE=deterministic ITERATIONS=20 just deploy openshift-storage portworx
+
+# Apply the RBAC and the chaos Job (see deploy/).
+deploy +namespaces:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ns="${NAMESPACE:-storage-chaos}"
+    {{ kubectl }} create namespace "$ns" --dry-run=client -o yaml | {{ kubectl }} apply -f -
+    for target in {{ namespaces }}; do
+        sed -e "s|__CHAOS_NAMESPACE__|$ns|g" -e "s|__TARGET_NAMESPACE__|$target|g" \
+            deploy/rbac.yaml | {{ kubectl }} apply -f -
+    done
+    # __NAMESPACES__ lands inside a YAML flow sequence, so the namespaces have
+    # to go in quoted and comma-separated: substituting them space-separated
+    # would make `args: [a b]` — one argument with a space in it, and a run
+    # that reports it cannot find the namespace "a b".
+    args=""
+    for target in {{ namespaces }}; do args="${args:+$args, }\"$target\""; done
+    sed -e "s|__CHAOS_NAMESPACE__|$ns|g" \
+        -e "s|__IMAGE__|{{ registry }}/{{ image }}:{{ tag }}|g" \
+        -e "s|__NAMESPACES__|$args|g" \
+        -e "s|__MODE__|${MODE:-random}|g" \
+        -e "s|__SEED__|${SEED:-1}|g" \
+        -e "s|__ITERATIONS__|${ITERATIONS:-10}|g" \
+        -e "s|__INTERVAL__|${INTERVAL:-60}|g" \
+        -e "s|__SELECTOR__|${SELECTOR:-}|g" \
+        -e "s|__INCLUDE__|${INCLUDE:-}|g" \
+        -e "s|__EXCLUDE__|${EXCLUDE:-}|g" \
+        -e "s|__DRY_RUN__|${DRY_RUN:-0}|g" \
+        deploy/job.yaml | {{ kubectl }} apply -f -
+    echo "watch it with: {{ kubectl }} -n $ns logs -f job/storage-chaos"
+    echo "get the report: {{ kubectl }} -n $ns cp <pod>:/out {{ results }}"
+
+# Delete the Job, the ServiceAccount and the RoleBindings again.
+undeploy +namespaces:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ns="${NAMESPACE:-storage-chaos}"
+    sed -e "s|__CHAOS_NAMESPACE__|$ns|g" -e "s|__IMAGE__||g" -e "s|__NAMESPACES__||g" \
+        -e "s|__MODE__||g" -e "s|__SEED__||g" -e "s|__ITERATIONS__||g" \
+        -e "s|__INTERVAL__||g" -e "s|__SELECTOR__||g" -e "s|__INCLUDE__||g" \
+        -e "s|__EXCLUDE__||g" -e "s|__DRY_RUN__||g" \
+        deploy/job.yaml | {{ kubectl }} delete --ignore-not-found -f -
+    for target in {{ namespaces }}; do
+        sed -e "s|__CHAOS_NAMESPACE__|$ns|g" -e "s|__TARGET_NAMESPACE__|$target|g" \
+            deploy/rbac.yaml | {{ kubectl }} delete --ignore-not-found -f -
+    done
+
+# Throwaway workloads that look enough like a storage provider to rehearse
+# against — a few 1-replica Deployments, a DaemonSet and a StatefulSet of pods
+# that sleep and go ready on a known delay. They run from the checkout rather
+# than from the image, which does not contain stage-fixture.sh and should not:
+# see the header of that script.
+#
+#   just fixture-up chaos-test
+#   MODE=deterministic ITERATIONS=6 INTERVAL=30 just chaos chaos-test
+#   just fixture-down chaos-test
+
+# Create the rehearsal workloads in a namespace.
+fixture-up namespace:
+    ./stage-fixture.sh up {{ namespace }}
+
+# Show them the way a chaos run sees them.
+fixture-status namespace:
+    ./stage-fixture.sh status {{ namespace }}
+
+# Delete them again (the namespace is left alone).
+fixture-down namespace:
+    ./stage-fixture.sh down {{ namespace }}
+
+# Uncompressed size of the loaded image, and of the tarball.
+size: build
+    @{{ engine }} image ls {{ image }}:{{ tag }}
+    @echo "tarball: $(du -h --dereference result | cut -f1)"
+
+# Both the build's own tag and `latest` are pushed, and both are tagged off the
+# single image that `load` just built, so `latest` cannot end up on an older
+# digest than the versioned tag.
+
+# Push to a registry (default: docker.io/athallerde).
+push registry=default_registry: load
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tags=({{ tag }})
+    [ "{{ tag }}" = latest ] || tags+=(latest)
+    for t in "${tags[@]}"; do
+        {{ engine }} tag {{ image }}:{{ tag }} {{ registry }}/{{ image }}:"$t"
+        {{ engine }} push {{ registry }}/{{ image }}:"$t"
+    done
+
+# Drop the nix-build symlink (it is also a GC root) and the local image.
+clean:
+    rm -f result
+    -{{ engine }} image rm {{ image }}:{{ tag }}

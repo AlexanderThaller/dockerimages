@@ -1,0 +1,54 @@
+# What storage-chaos needs to be allowed to do, and nothing else.
+#
+# Placeholders are substituted by `just deploy`, which applies this once per
+# target namespace:
+#   __CHAOS_NAMESPACE__   where the Job and its ServiceAccount live
+#   __TARGET_NAMESPACE__  a namespace it may delete pods in
+#
+# Or by hand:
+#   sed -e 's|__CHAOS_NAMESPACE__|storage-chaos|' \
+#       -e 's|__TARGET_NAMESPACE__|openshift-storage|' deploy/rbac.yaml | oc apply -f -
+#
+# A Role and a RoleBinding rather than the cluster-wide pair, so the blast
+# radius is a property of the cluster rather than of an environment variable
+# somebody set correctly. A chaos run that is only ever meant to touch
+# openshift-storage cannot be pointed at kube-system by a typo in INCLUDE if
+# there is no RoleBinding there.
+#
+# `list` is what finds the candidates, `get` is what the readiness poll reads,
+# and `delete` is the point. `create` is deliberately absent: the pods come
+# back because a DaemonSet or a Deployment brings them back, and nothing here
+# should be able to make one directly.
+#
+# SelfSubjectAccessReview — the `auth can-i` the script runs at startup — needs
+# no rule: every authenticated user may ask what they are allowed to do.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: storage-chaos
+  namespace: __CHAOS_NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: storage-chaos
+  namespace: __TARGET_NAMESPACE__
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: storage-chaos
+  namespace: __TARGET_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: storage-chaos
+subjects:
+  - kind: ServiceAccount
+    name: storage-chaos
+    namespace: __CHAOS_NAMESPACE__
