@@ -384,9 +384,38 @@ is.
 | `OSDS` | `3` | Single-replica Deployments to create |
 | `MONS` | `3` | StatefulSet replicas |
 | `PLUGIN` | `1` | Whether to create the DaemonSet |
-| `READY_AFTER` | `20` | Seconds a pod takes to become ready |
+| `READY_AFTER` | `20` | The floor: seconds before a pod goes ready |
+| `READY_SPREAD` | `20` | Uniform seconds drawn on top of it, per restart |
+| `READY_TAIL` | `45` | Extra seconds for the occasional slow one |
+| `READY_TAIL_PCT` | `12` | Percent of restarts that get the tail |
+| `READY_STAGGER` | `5` | Seconds added per workload, in creation order |
 | `IMAGE` | `ubi9/ubi-minimal` | Anything with a shell and `sleep` |
 | `RUN_AS_USER` | from the namespace | The uid the pods run as; see below |
+
+Recovery times vary per restart, which is what makes the report's charts worth
+looking at when rehearsing: a fixed delay draws a histogram with one bar in it.
+A pod waits `READY_AFTER` plus a uniform draw up to `READY_SPREAD`, and one in
+`READY_TAIL_PCT` waits `READY_TAIL` longer again. The tail is the point —
+storage recovers quickly most of the time and occasionally does not, and a
+symmetric spread hides exactly the case a chaos run is looking for.
+`READY_SPREAD=0` restores the old single fixed delay.
+
+`READY_STAGGER` separates the workloads from each other as well, so the
+per-component histogram facets differ. With the defaults, measured in the
+container:
+
+| workload | min | median | p90 | max |
+|---|---:|---:|---:|---:|
+| `chaos-osd-0` | 20s | 33s | 68s | 85s |
+| `chaos-osd-2` | 30s | 41s | 50s | 95s |
+| `chaos-plugin` | 35s | 47s | 84s | 100s |
+| `chaos-mon` | 40s | 52s | 91s | 105s |
+
+The randomness is drawn from the clock in POSIX shell — `date +%N`, falling
+back to `date +%s` — so the pods need no tool the image may not have. On an
+image whose `date` has no `%N` (busybox prints a literal `%N`) the fallback is
+per-second rather than per-pod, so two pods restarting inside the same second
+draw the same delay. The default image has `%N`.
 
 `RUN_AS_USER` is worked out from the namespace's
 `openshift.io/sa.scc.uid-range` annotation and only needs setting to override

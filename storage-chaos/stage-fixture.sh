@@ -42,7 +42,11 @@
 #   OSDS         chaos-osd Deployments to create   (default 3)
 #   MONS         chaos-mon StatefulSet replicas    (default 3)
 #   PLUGIN       1|0, create the DaemonSet         (default 1)
-#   READY_AFTER  seconds a pod takes to go ready   (default 20)
+#   READY_AFTER  the floor: seconds before ready     (default 20)
+#   READY_SPREAD uniform seconds on top of it        (default 20)
+#   READY_TAIL   extra seconds for the slow ones     (default 45)
+#   READY_TAIL_PCT  percent that get the tail        (default 12)
+#   READY_STAGGER   seconds added per workload       (default 5)
 #   IMAGE        image the pods run                (default ubi9/ubi-minimal)
 #   CPU / MEMORY resource requests per pod         (default 10m / 32Mi)
 #   RUN_AS_USER  uid the pods run as               (default: let the SCC pick)
@@ -98,6 +102,25 @@ init_config() {
   MONS="${MONS:-3}"
   PLUGIN="${PLUGIN:-1}"
   READY_AFTER="${READY_AFTER:-20}"
+
+# The shape of the recovery-time distribution the fixture produces. With
+# READY_SPREAD=0 every pod takes exactly READY_AFTER, which is what this did
+# before and which draws a histogram with one bar in it — fine for checking the
+# plumbing, useless for checking whether the charts say anything.
+#
+# A pod's delay is READY_AFTER plus a uniform draw up to READY_SPREAD, and one
+# in READY_TAIL_PCT of them gets READY_TAIL on top. The tail is the point:
+# storage recovers quickly most of the time and occasionally does not, and a
+# symmetric spread hides exactly the case a chaos run is looking for.
+READY_SPREAD="${READY_SPREAD:-20}"
+READY_TAIL="${READY_TAIL:-45}"
+READY_TAIL_PCT="${READY_TAIL_PCT:-12}"
+
+# Seconds added per workload, in creation order, so the components differ from
+# each other and not only within themselves — which is what makes the report's
+# per-component histogram facets worth looking at. 0 gives every workload the
+# same base.
+READY_STAGGER="${READY_STAGGER:-5}"
   IMAGE="${IMAGE:-registry.access.redhat.com/ubi9/ubi-minimal:latest}"
   CPU="${CPU:-10m}"
   MEMORY="${MEMORY:-32Mi}"
@@ -109,7 +132,7 @@ init_config() {
   read -r -a KUBECTL <<<"${KUBECTL:-kubectl}"
   kc() { "${KUBECTL[@]}" "$@"; }
 
-  for v in OSDS MONS READY_AFTER; do
+  for v in OSDS MONS READY_AFTER READY_SPREAD READY_TAIL READY_TAIL_PCT READY_STAGGER; do
     case "${!v}" in
     '' | *[!0-9]*)
       echo "$v must be a non-negative integer (got '${!v}')" >&2
@@ -167,8 +190,8 @@ resolve_uid() {
 # The probe's own period is 1s so that the file appearing and the pod going
 # Ready are not several seconds apart — the delay being measured is meant to be
 # READY_AFTER, not READY_AFTER plus a probe interval.
-pod_spec() { # <indent>
-  local i="$1"
+pod_spec() { # <indent> <base delay seconds>
+  local i="$1" base="$2"
   sed "s/^/$i/" <<SPECEOF
 securityContext:
   runAsNonRoot: true
@@ -178,7 +201,37 @@ securityContext:
 containers:
   - name: sleeper
     image: $IMAGE
-    command: ["/bin/sh", "-c", "sleep $READY_AFTER; touch /tmp/ready; exec sleep infinity"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # A different delay on every start, so a run against this fixture
+        # produces a distribution rather than one spike. Entropy comes from the
+        # clock, in POSIX shell arithmetic, with no awk, od or /dev/urandom
+        # needed in the image.
+        #
+        # Nanoseconds where date has them, which is the default image. Busybox
+        # prints a literal "%N" and some builds return all zeros, so both are
+        # caught and fall back to epoch seconds — coarser, because two pods
+        # restarting inside the same second then draw the same delay, but pods
+        # restarting seconds apart still differ. The leading zeros are stripped
+        # because shell arithmetic reads a leading zero as octal, and 048 is
+        # not a number at all.
+        n=\$(date +%N 2>/dev/null)
+        case "\$n" in '' | *[!0-9]*) n= ;; esac
+        n=\${n#\${n%%[!0]*}}
+        [ -n "\$n" ] || n=\$(date +%s)
+        d=\$(( $base + n % ($READY_SPREAD + 1) ))
+        # The long tail. Real storage recovers quickly most of the time and
+        # occasionally does not, and a symmetric spread hides exactly the case
+        # a chaos run is looking for. A different slice of the same number
+        # decides, so the two draws do not move together.
+        if [ \$(( (n / 100000) % 100 )) -lt $READY_TAIL_PCT ]; then
+          d=\$(( d + $READY_TAIL ))
+        fi
+        sleep \$d
+        touch /tmp/ready
+        exec sleep infinity
     readinessProbe:
       exec:
         command: ["/bin/sh", "-c", "test -f /tmp/ready"]
@@ -223,7 +276,7 @@ spec:
     metadata:
       labels: { app: chaos-osd, chaos-fixture: "true", osd-id: "$i" }
     spec:
-$(pod_spec "      ")
+$(pod_spec "      " "$((READY_AFTER + i * READY_STAGGER))")
 YAMLEOF
   done
 
@@ -243,7 +296,7 @@ spec:
     metadata:
       labels: { app: chaos-plugin, chaos-fixture: "true" }
     spec:
-$(pod_spec "      ")
+$(pod_spec "      " "$((READY_AFTER + OSDS * READY_STAGGER))")
 YAMLEOF
   fi
 
@@ -269,7 +322,7 @@ spec:
     metadata:
       labels: { app: chaos-mon, chaos-fixture: "true" }
     spec:
-$(pod_spec "      ")
+$(pod_spec "      " "$((READY_AFTER + (OSDS + 1) * READY_STAGGER))")
 YAMLEOF
   fi
 }
@@ -282,8 +335,10 @@ run_action() {
     manifests | kc apply -f - || exit 1
     echo
     echo "Fixture up in $NS: $OSDS osd deployments, $MONS mons$([ "$PLUGIN" -eq 1 ] && echo ", one plugin daemonset"), running as uid $POD_UID."
-    echo "Pods go ready ${READY_AFTER}s after they start, so that is what a"
-    echo "recovery on the chaos timeline should come out as."
+    echo "Pods go ready between ${READY_AFTER}s and $((READY_AFTER + (OSDS + 1) * READY_STAGGER + READY_SPREAD))s after they start,"
+    echo "and ${READY_TAIL_PCT}% of them take ${READY_TAIL}s longer still — so that is the spread the"
+    echo "recovery histogram from this fixture should show. READY_SPREAD=0"
+    echo "restores a single fixed delay."
     echo
     echo "  ./storage-chaos.sh $NS"
     echo "  INCLUDE='/chaos-osd-' ./storage-chaos.sh $NS      # the OSD lookalikes alone"
