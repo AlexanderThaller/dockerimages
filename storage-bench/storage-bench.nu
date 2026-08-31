@@ -28,7 +28,7 @@
 #   ORDER=by-test nu storage-bench.nu /data/ceph /data/portworx
 #
 # Tunables are the same environment variables, with the same defaults:
-#   OUTBASE RUNDIR ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME
+#   OUTBASE LABEL RUNDIR ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME
 #   IOENGINE LOG_AVG_MSEC PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS
 #   PGBENCH_TIME PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL PLOT RENDER
 #   ARCHIVE
@@ -370,7 +370,12 @@ def load-config [ts: string]: nothing -> record {
   # callers were passing the volume in before this was split. Setting RUNDIR
   # empty restores the flat behaviour.
   let outbase = (env-str "OUTBASE" (env-str "OUTDIR" "/tmp"))
-  let rundir = ($env | get --optional RUNDIR | default $"bench-results-($ts)")
+  # LABEL only shapes the default: it is folded into RUNDIR's fallback, so an
+  # explicit RUNDIR still wins outright and does not also grow a redundant
+  # -$label suffix.
+  let label = (env-str "LABEL" "")
+  let default_rundir = if ($label | is-empty) { $"bench-results-($ts)" } else { $"bench-results-($ts)-($label)" }
+  let rundir = ($env | get --optional RUNDIR | default $default_rundir)
   let outdir = (if ($rundir | is-empty) { $outbase } else { $"($outbase)/($rundir)" })
 
   let cfg = {

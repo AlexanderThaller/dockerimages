@@ -43,10 +43,12 @@
 #
 # Tunables (env vars):
 #   OUTBASE       directory the run dir goes in (default /tmp)
+#   LABEL         appended to the default RUNDIR (default none)
 #   RUNDIR        this run's directory inside it
-#                                               (default bench-results-<timestamp>;
-#                                                set it empty to write straight
-#                                                into OUTBASE)
+#                                               (default bench-results-<timestamp>,
+#                                                or bench-results-<timestamp>-<LABEL>
+#                                                if LABEL is set; set RUNDIR itself
+#                                                empty to write straight into OUTBASE)
 #   ORDER         by-mount | by-test            (default by-mount)
 #   REPEATS       times to run the whole suite  (default 3)
 #   SETTLE        seconds to idle between runs  (default 15)
@@ -104,8 +106,13 @@ TS="$(date +%Y%m%d-%H%M%S)"
 # passing the volume in before this was split — an old `OUTDIR=/out` now means
 # `/out/bench-results-<timestamp>` rather than being silently ignored. Setting
 # RUNDIR empty restores the flat behaviour.
+#
+# LABEL only shapes the default: it is folded into RUNDIR's fallback, so an
+# explicit RUNDIR still wins outright and a run named RUNDIR=before-upgrade
+# does not also grow a redundant -$LABEL suffix.
 OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
-RUNDIR="${RUNDIR-bench-results-$TS}"
+LABEL="${LABEL:-}"
+RUNDIR="${RUNDIR-bench-results-$TS${LABEL:+-$LABEL}}"
 OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 ORDER="${ORDER:-by-mount}"
 REPEATS="${REPEATS:-3}"

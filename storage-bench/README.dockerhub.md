@@ -74,7 +74,8 @@ Everything is an environment variable. There are no command-line flags.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OUTBASE` | `/tmp` | Directory the run directory is created in. Mount something here. |
-| `RUNDIR` | `bench-results-<timestamp>` | Name of the per-run directory. Set it to label a run (`RUNDIR=before-upgrade`); set it **empty** to write straight into `OUTBASE`. |
+| `LABEL` | none | Appended to the default `RUNDIR` (`LABEL=before-upgrade` → `bench-results-<timestamp>-before-upgrade`). Ignored if `RUNDIR` is set explicitly. |
+| `RUNDIR` | `bench-results-<timestamp>` | Name of the per-run directory. Set it to fully name a run (`RUNDIR=before-upgrade`); set it **empty** to write straight into `OUTBASE`. |
 | `ARCHIVE` | `1` | Tar the finished run directory into `<RUNDIR>.tar.gz`. `0` disables. |
 
 ### Run structure

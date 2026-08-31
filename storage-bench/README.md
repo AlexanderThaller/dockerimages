@@ -69,7 +69,8 @@ Defaults below are what the script uses, and are the same in
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OUTBASE` | `/tmp` | Directory the run directory is created in. Under `just`, this is the mounted `bench-results/`. |
-| `RUNDIR` | `bench-results-<timestamp>` | The per-run directory inside `OUTBASE`. Set it to a name to label a run (`RUNDIR=before-upgrade`); set it **empty** to write straight into `OUTBASE` rather than a subdirectory. |
+| `LABEL` | none | Appended to the default `RUNDIR`, so a run stays sortable by timestamp and still readable (`LABEL=before-upgrade` → `bench-results-<timestamp>-before-upgrade`). Only shapes the default — ignored once `RUNDIR` is set explicitly. |
+| `RUNDIR` | `bench-results-<timestamp>` | The per-run directory inside `OUTBASE`. Set it to a name to fully name a run (`RUNDIR=before-upgrade`), with no timestamp; set it **empty** to write straight into `OUTBASE` rather than a subdirectory. |
 | `OUTDIR` | — | Deprecated alias read as a fallback for `OUTBASE`. `OUTDIR=/out` means `/out/bench-results-<timestamp>`. |
 | `ARCHIVE` | `1` | Tar the finished run directory into `<RUNDIR>.tar.gz`, written beside it, so one file has to be copied off the machine that was measured. With `RUNDIR` empty the archive goes inside as `storage-bench-results.tar.gz`. `0` disables. |
 
