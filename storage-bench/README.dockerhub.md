@@ -91,6 +91,7 @@ Everything is an environment variable. There are no command-line flags.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FIO_TESTS` | all eight | Comma- or space-separated subset of the fio jobs to run, e.g. `FIO_TESTS=rand_rw_70_30_4k`. Runs in the fixed order regardless of how listed, since reads depend on the write job before them. `pgbench` has its own switch, `PGBENCH`, and is not part of this list. |
 | `FIO_SIZE` | `10G` | Working set per job. Should exceed RAM for the read tests to reach the storage rather than the page cache. |
 | `FIO_RUNTIME` | `60` | Seconds per job. Every path gets equal *time*, not equal *bytes*. |
 | `IOENGINE` | `libaio` | fio ioengine. |

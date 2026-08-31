@@ -28,10 +28,10 @@
 #   ORDER=by-test nu storage-bench.nu /data/ceph /data/portworx
 #
 # Tunables are the same environment variables, with the same defaults:
-#   OUTBASE LABEL RUNDIR ORDER REPEATS SETTLE TEST_SETTLE FIO_SIZE FIO_RUNTIME
-#   IOENGINE LOG_AVG_MSEC PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS
-#   PGBENCH_TIME PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL PLOT RENDER
-#   ARCHIVE
+#   OUTBASE LABEL RUNDIR ORDER REPEATS SETTLE TEST_SETTLE FIO_TESTS FIO_SIZE
+#   FIO_RUNTIME IOENGINE LOG_AVG_MSEC PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS
+#   PGBENCH_JOBS PGBENCH_TIME PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL PLOT
+#   RENDER ARCHIVE
 #
 # DD_ZERO_MB and DD_RAND_MB are gone with the dd tests they sized; see below.
 #
@@ -159,9 +159,11 @@
 # Constants
 # ---------------------------------------------------------------------------
 
-# Tests in execution order. Read tests depend on the write test that precedes
-# them, so this order matters in both ORDER modes.
-const TESTS = [
+# The fio jobs, in execution order. Read tests depend on the write test that
+# precedes them, so this order matters in both ORDER modes. pgbench is not in
+# this list — it has its own switch, PGBENCH, and is appended by
+# selected-tests below rather than being part of what FIO_TESTS narrows.
+const ALL_FIO_TESTS = [
   seq_write_1m
   seq_write_zero_1m
   seq_write_rand_1m
@@ -170,7 +172,6 @@ const TESTS = [
   rand_read_4k
   rand_rw_70_30_4k
   fsync_8k_qd1
-  pgbench
 ]
 
 const DDIR_NAME = [read write]
@@ -359,6 +360,30 @@ def env-choice [name: string, fallback: string, allowed: list<string>]: nothing 
     }
   }
   $v
+}
+
+# FIO_TESTS narrows ALL_FIO_TESTS to a comma- or space-separated subset, e.g.
+# FIO_TESTS=rand_rw_70_30_4k or FIO_TESTS="rand_write_4k,rand_read_4k". Unset
+# or empty runs all of them, as before. The result always keeps
+# ALL_FIO_TESTS's order regardless of how the subset was listed, since that
+# order is what keeps the write-then-read dependency intact, and pgbench is
+# appended after — it stays its own on/off switch, PGBENCH.
+def selected-tests []: nothing -> list<string> {
+  let raw = (env-str "FIO_TESTS" "")
+  let picked = if ($raw | is-empty) {
+    $ALL_FIO_TESTS
+  } else {
+    let requested = ($raw | str replace --all ',' ' ' | split row ' ' | where {|t| ($t | str length) > 0 })
+    for t in $requested {
+      if not ($t in $ALL_FIO_TESTS) {
+        error make --unspanned {
+          msg: $"FIO_TESTS: unknown test '($t)' — choose from: ($ALL_FIO_TESTS | str join ' ')"
+        }
+      }
+    }
+    $ALL_FIO_TESTS | where {|t| $t in $requested }
+  }
+  $picked | append pgbench
 }
 
 def load-config [ts: string]: nothing -> record {
@@ -2252,6 +2277,7 @@ def main [...mounts: string] {
   mkdir $mountinfo $plotdir
 
   let fio_args = (fio-job-args $cfg)
+  let tests = (selected-tests)
   let run_ids = (1..$cfg.repeats | each {|n| run-id-for $n })
 
   let ctx = {
@@ -2262,7 +2288,7 @@ def main [...mounts: string] {
     plotdir: $plotdir
     mountinfo: $mountinfo
     fio_args: $fio_args
-    fio_tests: ($TESTS | where {|t| $t in ($fio_args | columns) })
+    fio_tests: ($tests | where {|t| $t in ($fio_args | columns) })
     run_ids: $run_ids
     # Filled in after the graphs are drawn; the report functions read it.
     headline: { graphs: "", suffix: "", note: "" }
@@ -2328,13 +2354,13 @@ def main [...mounts: string] {
           # begins while the previous one's writeback is still in flight, and
           # that shows up in its first samples as the storage being slower than
           # it is.
-          $TESTS | enumerate | each {|t|
+          $tests | enumerate | each {|t|
             if $t.index > 0 { test-settle $cfg }
             run-test $ctx $paths $m.item $t.item
           }
         } | flatten
       } else {
-        $TESTS | enumerate | each {|t|
+        $tests | enumerate | each {|t|
           log-section $t.item
           $usable | enumerate | each {|m|
             # by-test already pauses between every (test, mount) unit, and

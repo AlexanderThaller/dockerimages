@@ -90,15 +90,23 @@ anything non-numeric silently disables them.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FIO_TESTS` | all eight | Comma- or space-separated subset of the fio jobs to run, e.g. `FIO_TESTS=rand_rw_70_30_4k` or `FIO_TESTS="rand_write_4k,rand_read_4k"`. Whatever order they're listed in, they still run in the order below, because the read jobs depend on the write job that precedes them. An unknown name stops the run rather than being silently skipped. |
 | `FIO_SIZE` | `10G` | Working set per fio job. Should exceed RAM for the read tests to reach the storage rather than the page cache. |
 | `FIO_RUNTIME` | `60` | Seconds per fio job. Every mount gets equal *time*, not equal *bytes*, so a slow backend cannot shorten its own run. |
 | `IOENGINE` | `libaio` | fio ioengine. The commit-latency test overrides this with `psync` regardless, because blocking is what it measures. |
 | `LOG_AVG_MSEC` | `100` | Time-series sample window, in milliseconds, and also the bucket width when concurrent jobs' samples are folded together. Going below ~100 is not advised: on slow storage a short window holds too few I/Os to mean anything, and per-job timestamp drift starts landing samples in the wrong bucket. Must be ≥ 1. |
 
-The eight fio jobs are fixed: `seq_write_1m`, `seq_write_zero_1m`,
+The eight fio jobs: `seq_write_1m`, `seq_write_zero_1m`,
 `seq_write_rand_1m`, `seq_read_1m`, `rand_write_4k`, `rand_read_4k`,
-`rand_rw_70_30_4k`, `fsync_8k_qd1`. The report explains what each one measures
-and quotes the exact command that ran.
+`rand_rw_70_30_4k`, `fsync_8k_qd1`. All run by default; `FIO_TESTS` narrows
+that. The report explains what each one measures and quotes the exact command
+that ran. `seq_read_1m` and `rand_read_4k` read back the file their paired
+write job wrote (`fio_seq.dat`, `fio_rand.dat`); selecting one without the
+other still works, but fio lays the file out itself first rather than reading
+one this run already wrote, so that job's timing includes an unmeasured setup
+pass.
+
+`pgbench` is not part of `FIO_TESTS` — it has its own switch, `PGBENCH`, below.
 
 ### pgbench
 

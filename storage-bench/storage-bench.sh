@@ -53,6 +53,8 @@
 #   REPEATS       times to run the whole suite  (default 3)
 #   SETTLE        seconds to idle between runs  (default 15)
 #   TEST_SETTLE   seconds to idle between tests (default 1)
+#   FIO_TESTS     comma/space-separated subset
+#                 of the fio jobs to run        (default all eight)
 #   FIO_SIZE      fio working set per job       (default 10G)
 #   FIO_RUNTIME   seconds per fio job           (default 60)
 #   IOENGINE      fio ioengine                  (default libaio)
@@ -296,9 +298,13 @@ mkdir -p "$MOUNTINFO" "$PLOTDIR" || {
   exit 1
 }
 
-# Tests in execution order. Read tests depend on the write test that precedes
-# them, so this order matters in both ORDER modes.
-TESTS=(
+# The fio jobs, in execution order. Read tests depend on the write test that
+# precedes them (seq_read_1m reads fio_seq.dat back, rand_read_4k reads
+# fio_rand.dat back), so this order matters in both ORDER modes, and selecting
+# a read job without its write job in FIO_TESTS below still works but costs
+# that read job an unmeasured setup pass: fio lays the file out itself before
+# timing starts, rather than reading one the run already wrote.
+ALL_FIO_TESTS=(
   seq_write_1m
   seq_write_zero_1m
   seq_write_rand_1m
@@ -307,8 +313,37 @@ TESTS=(
   rand_read_4k
   rand_rw_70_30_4k
   fsync_8k_qd1
-  pgbench
 )
+
+# FIO_TESTS narrows ALL_FIO_TESTS to a comma- or space-separated subset,
+# e.g. FIO_TESTS=rand_rw_70_30_4k or FIO_TESTS="rand_write_4k,rand_read_4k".
+# Unset or empty runs all of them, as before. The result always keeps
+# ALL_FIO_TESTS's order regardless of how the subset was listed, since that
+# order is what keeps the write-then-read dependency intact.
+#
+# pgbench is not part of this list — it stays its own on/off switch, PGBENCH,
+# because "not selected in FIO_TESTS" and "postgres unavailable" are different
+# reasons for the same absence and the report explains them differently.
+TESTS=()
+if [ -n "${FIO_TESTS:-}" ]; then
+  declare -A _want_test=()
+  for _t in ${FIO_TESTS//,/ }; do
+    case " ${ALL_FIO_TESTS[*]} " in
+    *" $_t "*) _want_test["$_t"]=1 ;;
+    *)
+      echo "FIO_TESTS: unknown test '$_t' — choose from: ${ALL_FIO_TESTS[*]}" >&2
+      exit 1
+      ;;
+    esac
+  done
+  for _t in "${ALL_FIO_TESTS[@]}"; do
+    [ -n "${_want_test[$_t]:-}" ] && TESTS+=("$_t")
+  done
+  unset _t _want_test
+else
+  TESTS=("${ALL_FIO_TESTS[@]}")
+fi
+TESTS+=(pgbench)
 
 # Filled in by run_fio, read by the report: test name -> the flags it was given.
 declare -A FIO_ARGS=()
