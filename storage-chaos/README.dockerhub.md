@@ -74,6 +74,7 @@ name can express.
 | `MIN_READY` | `0` | Ready pods a group must keep |
 | `DRY_RUN` | `0` | Resolve, log and report; delete nothing |
 | `OUTBASE` | `/tmp` | Directory the run directory goes in |
+| `LABEL` | none | Appended to the default `RUNDIR` (`LABEL=osd-kills` → `chaos-<ts>-osd-kills`). Ignored if `RUNDIR` is set explicitly. |
 | `RUNDIR` | `chaos-<ts>` | This run's directory inside it |
 | `REPORT` | `html` | `html`, `md` or `none` |
 | `HOLD` | `0` | Seconds to stay alive after the report is written |

@@ -202,6 +202,7 @@ the replacement start before the old container is necessarily gone.
 | Variable | Default | What it does |
 |---|---|---|
 | `OUTBASE` | `/tmp` | Directory the run directory goes in |
+| `LABEL` | none | Appended to the default `RUNDIR`, so a run stays sortable by timestamp and still readable (`LABEL=osd-kills` → `chaos-<timestamp>-osd-kills`). Only shapes the default — ignored once `RUNDIR` is set explicitly. |
 | `RUNDIR` | `chaos-<timestamp>` | This run's directory inside it; empty writes straight into `OUTBASE` |
 | `REPORT` | `html` | `html`, `md` or `none` |
 | `HOLD` | `0` | Seconds to stay alive after the report is written |

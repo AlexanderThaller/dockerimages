@@ -145,10 +145,12 @@ export LC_ALL=C TZ=UTC
 #
 # OUTBASE and RUNDIR carry their defaults here only as documentation — the real
 # ones are computed below, because OUTBASE honours the legacy OUTDIR spelling
-# and RUNDIR distinguishes unset from deliberately empty.
+# and RUNDIR distinguishes unset from deliberately empty. LABEL is real: its
+# default is genuinely the empty string, folded into RUNDIR's fallback below.
 TUNABLE_SPEC=(
   "OUTBASE|/tmp|directory the run directory goes in"
-  "RUNDIR|chaos-<timestamp>|run dir inside it; empty writes into OUTBASE"
+  "LABEL||appended to the default RUNDIR"
+  "RUNDIR|chaos-<timestamp>[-LABEL]|run dir inside it; empty writes into OUTBASE"
   "SELECTOR||label selector for candidate pods"
   "INCLUDE||regex a <namespace>/<pod> must match"
   "EXCLUDE||regex a <namespace>/<pod> must not match"
@@ -304,8 +306,13 @@ init_config() {
   # Split the way storage-bench.sh splits it, and for the same reason: OUTBASE is
   # the volume and stays put, RUNDIR is per-run and carries the timestamp, so a
   # second run sits beside the first rather than overwriting it.
+  #
+  # LABEL only shapes the default: it is folded into RUNDIR's fallback, so an
+  # explicit RUNDIR still wins outright and a run named RUNDIR=osd-kills does
+  # not also grow a redundant -$LABEL suffix.
   OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
-  RUNDIR="${RUNDIR-chaos-$TS}"
+  LABEL="${LABEL:-}"
+  RUNDIR="${RUNDIR-chaos-$TS${LABEL:+-$LABEL}}"
   OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
 
   # Defaults, applied from TUNABLE_SPEC. OUTBASE and RUNDIR are already set
