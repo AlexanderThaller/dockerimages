@@ -1,28 +1,32 @@
 # The runtime closure storage-bench.sh needs, shared by the container image
 # (default.nix) and the host shell (shell.nix) so the two cannot drift apart.
 #
-# Drift is the reason this is its own file: a host run that is missing gnuplot
-# still completes the benchmark, it just silently produces a report with no
-# graphs in it — the kind of difference you notice an hour after the run.
+# Drift is the reason this is its own file: a host run that is missing
+# cmark-gfm still completes the benchmark, it just silently produces a report
+# with no HTML rendering — the kind of difference you notice an hour after the
+# run.
 #
-# fio and gnuplot are trimmed variants rather than the stock packages. Stock,
-# both carry optional features this benchmark never touches, and between them
-# they were most of the image. Each override below says what it drops and what
-# would notice; `just size` is what tells you whether it is still true after a
-# nixpkgs bump.
+# fio is a trimmed variant rather than the stock package. Stock, it carries
+# optional features this benchmark never touches. The override below says
+# what it drops and what would notice; `just size` is what tells you whether
+# it is still true after a nixpkgs bump.
+#
+# gnuplot used to be here too, for the graphs. It is not any more: the graphs
+# are drawn by gawk itself now (render-chart.awk, materialised by
+# storage-bench.sh at runtime), the same way storage-chaos.sh has always drawn
+# its own — no rasteriser, no SVG terminal, one less package in the closure.
 
 pkgs:
 
 let
-  inherit (pkgs) lib;
-
   # fio installs five Python helper scripts next to its binaries — fio2gnuplot,
   # fiologparser*, fio_jsonplus_clat2csv — and nixpkgs wraps them, which pins
   # CPython into the closure at ~130 MB. The script calls none of them: it
-  # drives gnuplot itself, because fio2gnuplot plots one file pattern per chart
-  # rather than overlaying the mounts under test on shared axes. libnbd goes the
-  # same way: it is fio's network-block-device ioengine, useless against a
-  # mounted filesystem, and it drags in gnutls and p11-kit.
+  # draws its own charts (render-chart.awk), overlaying the mounts under test
+  # on shared axes, which fio2gnuplot does not do — it plots one file pattern
+  # per chart. libnbd goes the same way: it is fio's network-block-device
+  # ioengine, useless against a mounted filesystem, and it drags in gnutls and
+  # p11-kit.
   #
   # `fio --enghelp` in the image no longer lists nbd. The logs under fio-logs/
   # are still fio's standard format, so the Python tools read them fine on a
@@ -34,37 +38,6 @@ let
             $out/bin/fiologparser.py $out/bin/fiologparser_hist.py \
             $out/bin/fio-histo-log-pctiles.py
     '';
-  });
-
-  # The script plots with `set terminal svg`, which gnuplot implements itself —
-  # it writes markup and lets the browser do the drawing, so it needs no
-  # graphics library at all. Everything a rasterising terminal would need comes
-  # off: libgd and its libavif AV1 codecs (~25 MB) for the png/gif/jpeg/sixel
-  # terminals, cairo/pango/glib/harfbuzz/freetype/fontconfig (~30 MB) for the
-  # *cairo ones, the X11 client libraries for the interactive x11 terminal, and
-  # the DejaVu font and fonts.conf that fontconfig needed to find a face.
-  #
-  # What survives: svg, dumb, canvas, postscript and the LaTeX terminals. What
-  # is gone: png, pngcairo, pdfcairo, gif, jpeg, sixel, x11. If a .gp file under
-  # graphs/ is ever changed to one of those, this is why gnuplot answers
-  # "unknown or ambiguous terminal type".
-  gnuplot = pkgs.gnuplot.overrideAttrs (old: {
-    buildInputs = lib.filter
-      (p: !(lib.elem (lib.getName p) [
-        "gd"
-        "cairo"
-        "pango"
-        "fontconfig"
-        "libx11"
-        "libxpm"
-        "libxt"
-        "libxaw"
-      ]))
-      old.buildInputs;
-    configureFlags = [ "--without-x" "--without-qt" "--without-aquaterm" ];
-    # Upstream's postInstall wraps gnuplot to set GDFONTPATH, which only the
-    # libgd terminals read. Without libgd there is nothing left to wrap.
-    postInstall = "";
   });
 
   # The report is Markdown, and this is what turns it into HTML: GitHub's
@@ -133,19 +106,19 @@ in
   # Everything storage-bench.sh shells out to, plus the tool that renders its
   # report. gawk/gnugrep parse fio's terse output and pick the mount under test
   # out of /proc/mounts, gnused pulls the figures out of pgbench's summary, and
-  # gawk also folds fio's time-series logs into the per-series data files that
-  # gnuplot draws — and assembles the HTML around cmark-gfm's output.
+  # gawk also folds fio's time-series logs into the per-series data files —
+  # and now draws the SVGs from them too (render-chart.awk), and assembles the
+  # HTML around cmark-gfm's output.
   #
   # coreutils covers more than it looks: `df` for the per-mount capacity in the
-  # report, `uname -n` for its host header, which is why there is no hostname(1)
-  # here, and `base64` for inlining the graphs into the single-file HTML. It is
-  # no longer here for `dd` — the three dd tests are two fio jobs now — but the
-  # rest of that list keeps it. The mount table comes from /proc/mounts, which
-  # is why there is no util-linux either: it was carried for that one command,
-  # and the full build links PAM, systemd and shadow behind it.
+  # report, and `uname -n` for its host header, which is why there is no
+  # hostname(1) here. It is no longer here for `dd` — the three dd tests are
+  # two fio jobs now — but the rest of that list keeps it. The mount table
+  # comes from /proc/mounts, which is why there is no util-linux either: it
+  # was carried for that one command, and the full build links PAM, systemd
+  # and shadow behind it.
   packages = [
     fio
-    gnuplot
     cmark-gfm
     postgresql
   ] ++ (with pkgs; [

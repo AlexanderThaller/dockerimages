@@ -11,7 +11,8 @@ writes included — which is always less, and is the number an application would
 recognise.
 
 No distro userland, no package manager: the image is a Nix closure of fio,
-gnuplot, postgresql, cmark-gfm and bash — 43 MB compressed, 132 MB on disk.
+postgresql, cmark-gfm and bash — 41 MB compressed, 133 MB on disk. The graphs
+are drawn by awk itself, so there is no gnuplot or other rasteriser in here.
 
 ## Run it
 
@@ -128,7 +129,7 @@ working set would report the speed of RAM. `fsync`, `synchronous_commit` and
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PLOT` | `1` | `0` skips the gnuplot graphs. |
+| `PLOT` | `1` | `0` skips the graphs. |
 | `RENDER` | `html` | `none` writes only the Markdown. |
 
 ## What you get
@@ -164,9 +165,8 @@ minutes per path**. Two paths is an hour and a half.
 - The image ships `/etc/passwd` writable so the script can add an entry for
   whatever uid `--user` gives it; PostgreSQL treats a failed `getpwuid()` as
   fatal and would otherwise refuse to start.
-- Skipped work is always explained: if postgres is missing, if it is running as
-  root, or if gnuplot is unavailable, the report says so rather than quietly
-  omitting a section.
+- Skipped work is always explained: if postgres is missing, or if it is running
+  as root, the report says so rather than quietly omitting a section.
 
 Source, and a Nushell implementation of the same benchmark, at
 <https://git.thaller.ws/athaller/dockerimages>.

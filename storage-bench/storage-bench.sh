@@ -7,12 +7,13 @@
 #   ./storage-bench.sh /data/ceph /data/portworx
 #   ORDER=by-test ./storage-bench.sh /data/ceph /data/portworx
 #
-# The graphs need gnuplot and the rendered report needs cmark-gfm, neither of
-# which a host necessarily has; both are in the image, and shell.nix puts the
-# same set on a host:
+# The graphs are drawn by awk itself — see render-chart.awk, materialised
+# under graphs/ at startup — so nothing extra is needed for those. The
+# rendered HTML report needs cmark-gfm, which a host does not necessarily
+# have; it is in the image, and shell.nix puts it on a host too:
 #   nix-shell --run './storage-bench.sh /tank/backup'
-# Without them the benchmark still runs, it just produces a thinner report and
-# says so at the end.
+# Without it the benchmark still runs, it just leaves the report as Markdown
+# and says so at the end.
 #
 # Run order (ORDER):
 #   by-mount  (default)  full suite on mount 1, then full suite on mount 2.
@@ -68,7 +69,7 @@
 #                 before it                     (default 30)
 #   PGBENCH_MODE  simple | extended | prepared  (default prepared)
 #   PGBENCH_MAX_WAL  postgres max_wal_size      (default 4GB)
-#   PLOT          1|0, draw the gnuplot graphs  (default 1)
+#   PLOT          1|0, draw the graphs          (default 1)
 #   RENDER        html|none                     (default html)
 #   ARCHIVE       1|0, tar.gz the run directory  (default 1)
 #
@@ -95,10 +96,27 @@
 set -uo pipefail
 export LC_ALL=C
 
-MOUNTS=("$@")
-[ ${#MOUNTS[@]} -eq 0 ] && echo "Usage: $0 <mount1> [<mount2> ...]" >&2 && exit 1
+# --replot <dir> skips the benchmark entirely and rebuilds the graphs and the
+# report from a previous run's own output — its fio-logs/, pgbench logs and
+# CSVs are all that redrawing needs, so a change to the drawing or reporting
+# code can be tried against a real run without paying for fio and pgbench
+# again. REPLOT_DIR being set is what every section below that touches a
+# mount, runs fio/pgbench or writes RUNDIR guards itself on.
+REPLOT_DIR=""
+if [ "${1:-}" = "--replot" ]; then
+  REPLOT_DIR="${2:-}"
+  [ -n "$REPLOT_DIR" ] && [ -d "$REPLOT_DIR" ] || {
+    echo "Usage: $0 --replot <results-dir>" >&2
+    exit 1
+  }
+  shift 2
+fi
 
-TS="$(date +%Y%m%d-%H%M%S)"
+MOUNTS=("$@")
+if [ -z "$REPLOT_DIR" ]; then
+  [ ${#MOUNTS[@]} -eq 0 ] && echo "Usage: $0 <mount1> [<mount2> ...] | --replot <results-dir>" >&2 && exit 1
+fi
+
 # Where the results go, in two parts, so that pointing the benchmark at a
 # mounted volume does not also flatten every run into the same directory. The
 # volume is OUTBASE and stays put; RUNDIR is per-run and carries the timestamp,
@@ -112,10 +130,24 @@ TS="$(date +%Y%m%d-%H%M%S)"
 # LABEL only shapes the default: it is folded into RUNDIR's fallback, so an
 # explicit RUNDIR still wins outright and a run named RUNDIR=before-upgrade
 # does not also grow a redundant -$LABEL suffix.
-OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
-LABEL="${LABEL:-}"
-RUNDIR="${RUNDIR-bench-results-$TS${LABEL:+-$LABEL}}"
-OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
+#
+# --replot bypasses all of this and points OUTDIR straight at the directory
+# it was given — there is no OUTBASE/RUNDIR split for a run that already has
+# a directory.
+if [ -n "$REPLOT_DIR" ]; then
+  OUTDIR="${REPLOT_DIR%/}"
+  # Empty rather than unset: the archive step (see Archive, below) treats an
+  # empty RUNDIR as "the run directory already exists, archive it in place" —
+  # exactly what replotting an existing directory needs, and it does not
+  # reference OUTBASE on this path, so that one is left genuinely unset.
+  RUNDIR=""
+else
+  TS="$(date +%Y%m%d-%H%M%S)"
+  OUTBASE="${OUTBASE:-${OUTDIR:-/tmp}}"
+  LABEL="${LABEL:-}"
+  RUNDIR="${RUNDIR-bench-results-$TS${LABEL:+-$LABEL}}"
+  OUTDIR="$OUTBASE${RUNDIR:+/$RUNDIR}"
+fi
 ORDER="${ORDER:-by-mount}"
 REPEATS="${REPEATS:-3}"
 SETTLE="${SETTLE:-15}"
@@ -399,7 +431,7 @@ test_settle() {
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-command -v fio >/dev/null 2>&1 || {
+[ -n "$REPLOT_DIR" ] || command -v fio >/dev/null 2>&1 || {
   echo "fio not found in PATH" >&2
   exit 1
 }
@@ -411,13 +443,11 @@ command -v fio >/dev/null 2>&1 || {
 # well out of sight by the time anyone looks at the results.
 MISSING=()
 
-have_gnuplot=0
-if [ "$PLOT" = "1" ] && command -v gnuplot >/dev/null 2>&1; then
-  have_gnuplot=1
-elif [ "$PLOT" = "1" ]; then
-  echo "NOTE gnuplot not found in PATH — the report will have NO GRAPHS" >&2
-  MISSING+=("gnuplot — the report has no graphs")
-fi
+# Drawing is awk against the reduced .dat series, same as the rest of the
+# script's parsing — there is no external tool to be missing, so this is
+# purely the PLOT=0 opt-out rather than a degraded-mode check.
+have_plot=0
+[ "$PLOT" = "1" ] && have_plot=1
 
 if [ "$RENDER" != "none" ] && ! command -v cmark-gfm >/dev/null 2>&1; then
   echo "NOTE cmark-gfm not found in PATH — report stays as Markdown source" >&2
@@ -452,67 +482,6 @@ ensure_passwd_entry() {
 PG_VERSION="$(postgres --version 2>/dev/null | awk '{print $NF}')"
 [ -n "$PG_VERSION" ] || PG_VERSION="not present"
 
-have_pgbench=0
-if [ "$PGBENCH" = "1" ]; then
-  if [ "$(id -u)" -eq 0 ]; then
-    echo "NOTE running as uid 0 — postgres refuses to run as root, skipping pgbench" >&2
-    MISSING+=("pgbench — skipped, postgres will not run as root")
-  elif ! command -v initdb >/dev/null 2>&1 ||
-    ! command -v pg_ctl >/dev/null 2>&1 ||
-    ! command -v pgbench >/dev/null 2>&1; then
-    echo "NOTE postgres not found in PATH — the report will have NO PGBENCH RESULTS" >&2
-    MISSING+=("postgresql — the pgbench workload did not run")
-  elif ! ensure_passwd_entry; then
-    echo "NOTE uid $(id -u) has no /etc/passwd entry and it is not writable —" >&2
-    echo "     postgres cannot start, skipping pgbench" >&2
-    MISSING+=("passwd entry for uid $(id -u) — the pgbench workload did not run")
-  else
-    have_pgbench=1
-  fi
-fi
-
-# The socket lives off the mount under test, in TMPDIR, for two reasons: a unix
-# socket on the storage being hammered is not something to measure, and the
-# path has to fit in sockaddr_un.sun_path, which is 108 bytes including the
-# ".s.PGSQL.5432" the server appends. A deep OUTDIR would blow that; TMPDIR
-# usually will not, and if it does the workload is skipped rather than failing
-# halfway through the run.
-if [ "$have_pgbench" = 1 ]; then
-  PG_SOCKDIR="$(mktemp -d 2>/dev/null)"
-  if [ -z "$PG_SOCKDIR" ] || [ ${#PG_SOCKDIR} -gt 90 ]; then
-    echo "NOTE cannot make a short enough socket directory under ${TMPDIR:-/tmp} —" >&2
-    echo "     skipping pgbench (unix socket paths are limited to 108 bytes)" >&2
-    MISSING+=("pgbench — no usable socket directory under ${TMPDIR:-/tmp}")
-    [ -n "$PG_SOCKDIR" ] && rmdir "$PG_SOCKDIR" 2>/dev/null
-    PG_SOCKDIR=""
-    have_pgbench=0
-  fi
-fi
-
-USABLE=()
-for mp in "${MOUNTS[@]}"; do
-  if [ ! -d "$mp" ]; then
-    echo "SKIP $mp — not a directory" >&2
-    continue
-  fi
-  if ! touch "$mp/.writetest.$$" 2>/dev/null; then
-    echo "SKIP $mp — not writable by uid $(id -u)" >&2
-    continue
-  fi
-  rm -f "$mp/.writetest.$$"
-  USABLE+=("$mp")
-done
-
-if [ ${#USABLE[@]} -eq 0 ]; then
-  echo "No usable mount points. Nothing to do." >&2
-  exit 1
-fi
-
-echo "Benchmarking : ${USABLE[*]}"
-echo "Run order    : $ORDER"
-echo "Settle       : ${SETTLE}s between runs, ${TEST_SETTLE}s between tests"
-echo "Results dir  : $OUTDIR"
-
 # The line in /proc/mounts for the filesystem a path is *on*: the longest mount
 # point that prefixes it, which is the same rule df applies.
 #
@@ -535,27 +504,144 @@ owning_mount() { # <path>
   ' /proc/mounts
 }
 
-# Register the files we will create so cleanup can remove them.
-for mp in "${USABLE[@]}"; do
-  CREATED+=("$mp/fio_seq.dat" "$mp/fio_seq_zero.dat" "$mp/fio_seq_rand.dat"
-    "$mp/fio_rand.dat" "$mp/fio_mix.dat" "$mp/fio_sync.dat")
-  sl="$(slug "$mp")"
-  df -h "$mp" >"$MOUNTINFO/df_${sl}.txt" 2>&1
-  # /proc/mounts rather than mount(8): the same device/fstype/options in the
-  # same fstab columns, and it keeps util-linux out of the image entirely, which
-  # was ~25 MB once its PAM and systemd links are counted. mount(8) is the
-  # fallback for a host that has no /proc, and gets the old substring match
-  # because its output is not in the same columns.
-  if [ -r /proc/mounts ]; then
-    owning_mount "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
-  elif command -v mount >/dev/null 2>&1; then
-    mount | grep -F "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
+if [ -n "$REPLOT_DIR" ]; then
+  # Nothing here touches a mount, runs fio/pgbench, or truncates a CSV — all
+  # of that already happened in the run being replotted. USABLE, have_pgbench
+  # and PG_VERSION are recovered from what that run left behind instead.
+  [ -f "$FIO_CSV" ] || {
+    echo "$FIO_CSV not found — $REPLOT_DIR does not look like a storage-bench results directory" >&2
+    exit 1
+  }
+  readarray -t USABLE < <(tail -n +2 "$FIO_CSV" | awk -F, '!seen[$2]++ { print $2 }')
+  if [ ${#USABLE[@]} -eq 0 ]; then
+    echo "No mounts found in $FIO_CSV. Nothing to replot." >&2
+    exit 1
   fi
-done
 
-echo "run,mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
-[ "$have_pgbench" = 1 ] &&
-  echo "run,mount,scale,clients,threads,mode,warmup_s,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
+  have_pgbench=0
+  [ -s "$PG_CSV" ] && [ "$(wc -l <"$PG_CSV")" -gt 1 ] && have_pgbench=1
+
+  # Best-effort: the original report's own property table, which is more
+  # likely to be right than a live `postgres --version` on whatever machine
+  # is replotting this.
+  if [ -f "$MD" ]; then
+    v="$(awk -F'|' '$2 ~ /postgres version/ { gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3; exit }' "$MD")"
+    [ -n "$v" ] && PG_VERSION="$v"
+  fi
+
+  # Same idea, for the tunables that only shape the report's prose and
+  # headings — ORDER, SETTLE and the rest never affect what gets redrawn
+  # (fio_series/pgbench_series read the raw logs fresh every time), but a
+  # replotted report claiming today's defaults for a run that overrode them
+  # would be actively misleading rather than merely incomplete. Silently
+  # keeps today's environment/defaults for anything the old report does not
+  # have — an old run predating this table, or one with RENDER=none — since
+  # that is exactly what those already are.
+  if [ -f "$MD" ]; then
+    load_replot_param() { # <label as it appears in the old table> <var name>
+      local val
+      val="$(awk -F'|' -v want="$2" '
+        { gsub(/^[ \t]+|[ \t]+$/, "", $2) }
+        $2 == want { gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3; exit }
+      ' "$1")"
+      [ -n "$val" ] && printf '%s' "$val"
+    }
+    v="$(load_replot_param "$MD" "Run order")"; [ -n "$v" ] && ORDER="$v"
+    v="$(load_replot_param "$MD" "Settle between runs")"; [ -n "$v" ] && SETTLE="${v%s}"
+    v="$(load_replot_param "$MD" "Settle between tests")"; [ -n "$v" ] && TEST_SETTLE="${v%s}"
+    v="$(load_replot_param "$MD" "fio working set")"; [ -n "$v" ] && FIO_SIZE="$v"
+    v="$(load_replot_param "$MD" "fio runtime per job")"; [ -n "$v" ] && FIO_RUNTIME="${v%s}"
+    v="$(load_replot_param "$MD" "fio ioengine")"; [ -n "$v" ] && IOENGINE="$v"
+    v="$(load_replot_param "$MD" "fio log sample window")"; [ -n "$v" ] && LOG_AVG_MSEC="${v%ms}"
+    unset -f load_replot_param
+  fi
+
+  echo "Replotting   : $OUTDIR"
+  echo "Mounts       : ${USABLE[*]}"
+else
+  USABLE=()
+  for mp in "${MOUNTS[@]}"; do
+    if [ ! -d "$mp" ]; then
+      echo "SKIP $mp — not a directory" >&2
+      continue
+    fi
+    if ! touch "$mp/.writetest.$$" 2>/dev/null; then
+      echo "SKIP $mp — not writable by uid $(id -u)" >&2
+      continue
+    fi
+    rm -f "$mp/.writetest.$$"
+    USABLE+=("$mp")
+  done
+
+  if [ ${#USABLE[@]} -eq 0 ]; then
+    echo "No usable mount points. Nothing to do." >&2
+    exit 1
+  fi
+
+  echo "Benchmarking : ${USABLE[*]}"
+  echo "Run order    : $ORDER"
+  echo "Settle       : ${SETTLE}s between runs, ${TEST_SETTLE}s between tests"
+  echo "Results dir  : $OUTDIR"
+
+  have_pgbench=0
+  if [ "$PGBENCH" = "1" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      echo "NOTE running as uid 0 — postgres refuses to run as root, skipping pgbench" >&2
+      MISSING+=("pgbench — skipped, postgres will not run as root")
+    elif ! command -v initdb >/dev/null 2>&1 ||
+      ! command -v pg_ctl >/dev/null 2>&1 ||
+      ! command -v pgbench >/dev/null 2>&1; then
+      echo "NOTE postgres not found in PATH — the report will have NO PGBENCH RESULTS" >&2
+      MISSING+=("postgresql — the pgbench workload did not run")
+    elif ! ensure_passwd_entry; then
+      echo "NOTE uid $(id -u) has no /etc/passwd entry and it is not writable —" >&2
+      echo "     postgres cannot start, skipping pgbench" >&2
+      MISSING+=("passwd entry for uid $(id -u) — the pgbench workload did not run")
+    else
+      have_pgbench=1
+    fi
+  fi
+
+  # The socket lives off the mount under test, in TMPDIR, for two reasons: a
+  # unix socket on the storage being hammered is not something to measure, and
+  # the path has to fit in sockaddr_un.sun_path, which is 108 bytes including
+  # the ".s.PGSQL.5432" the server appends. A deep OUTDIR would blow that;
+  # TMPDIR usually will not, and if it does the workload is skipped rather
+  # than failing halfway through the run.
+  if [ "$have_pgbench" = 1 ]; then
+    PG_SOCKDIR="$(mktemp -d 2>/dev/null)"
+    if [ -z "$PG_SOCKDIR" ] || [ ${#PG_SOCKDIR} -gt 90 ]; then
+      echo "NOTE cannot make a short enough socket directory under ${TMPDIR:-/tmp} —" >&2
+      echo "     skipping pgbench (unix socket paths are limited to 108 bytes)" >&2
+      MISSING+=("pgbench — no usable socket directory under ${TMPDIR:-/tmp}")
+      [ -n "$PG_SOCKDIR" ] && rmdir "$PG_SOCKDIR" 2>/dev/null
+      PG_SOCKDIR=""
+      have_pgbench=0
+    fi
+  fi
+
+  # Register the files we will create so cleanup can remove them.
+  for mp in "${USABLE[@]}"; do
+    CREATED+=("$mp/fio_seq.dat" "$mp/fio_seq_zero.dat" "$mp/fio_seq_rand.dat"
+      "$mp/fio_rand.dat" "$mp/fio_mix.dat" "$mp/fio_sync.dat")
+    sl="$(slug "$mp")"
+    df -h "$mp" >"$MOUNTINFO/df_${sl}.txt" 2>&1
+    # /proc/mounts rather than mount(8): the same device/fstype/options in the
+    # same fstab columns, and it keeps util-linux out of the image entirely,
+    # which was ~25 MB once its PAM and systemd links are counted. mount(8) is
+    # the fallback for a host that has no /proc, and gets the old substring
+    # match because its output is not in the same columns.
+    if [ -r /proc/mounts ]; then
+      owning_mount "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
+    elif command -v mount >/dev/null 2>&1; then
+      mount | grep -F "$mp" >"$MOUNTINFO/mount_${sl}.txt" 2>&1
+    fi
+  done
+
+  echo "run,mount,test,read_iops,read_bw_kibs,read_clat_mean_us,write_iops,write_bw_kibs,write_clat_mean_us" >"$FIO_CSV"
+  [ "$have_pgbench" = 1 ] &&
+    echo "run,mount,scale,clients,threads,mode,warmup_s,duration_s,init_s,tps,latency_avg_ms,transactions,failed" >"$PG_CSV"
+fi
 
 # ---------------------------------------------------------------------------
 # fio helper
@@ -870,55 +956,74 @@ START_EPOCH=$(date +%s)
 
 RUN_IDS=()
 
-for pass in $(seq 1 "$REPEATS"); do
-  set_run_paths "$pass"
-  RUN_IDS+=("$RUN_ID")
-
-  if [ "$REPEATS" -gt 1 ]; then
-    log "pass $pass of $REPEATS ($RUN_ID)"
-    # The same cooldown that separates runs within a pass separates the passes
-    # themselves, so pass 2 does not start measuring while the backend is still
-    # flushing what pass 1 wrote.
-    [ "$pass" -gt 1 ] && settle
+if [ -n "$REPLOT_DIR" ]; then
+  # RUN_IDS the way every other pass-specific thing in this script is found:
+  # by the directory raw/<pass>/ that a real pass leaves behind, not by
+  # replaying REPEATS against fio and pgbench again.
+  readarray -t RUN_IDS < <(cd "$OUTDIR/raw" 2>/dev/null && ls -d run-* 2>/dev/null | sort)
+  if [ ${#RUN_IDS[@]} -eq 0 ]; then
+    echo "No raw/run-* directories under $OUTDIR. Nothing to replot." >&2
+    exit 1
   fi
+  REPEATS=${#RUN_IDS[@]}
+  # Points RAWDIR/LOGDIR/PLOTDATA at the last pass, same as the last iteration
+  # of a real run would have left them — nothing after this point reads them
+  # for any pass but the last.
+  set_run_paths "$REPEATS"
+  ELAPSED_LABEL="n/a (this report was rebuilt with --replot; see the original report for the real figure)"
+else
+  for pass in $(seq 1 "$REPEATS"); do
+    set_run_paths "$pass"
+    RUN_IDS+=("$RUN_ID")
 
-  if [ "$ORDER" = "by-mount" ]; then
-    first_mount=1
-    for mp in "${USABLE[@]}"; do
-      [ $first_mount -eq 0 ] && {
-        log "cooldown between mounts"
-        settle
-      }
-      first_mount=0
-      log "$mp"
-      first_test=1
-      for t in "${TESTS[@]}"; do
-        # The gap between consecutive tests on one mount. Without it a test
-        # begins while the previous one's writeback is still in flight, and
-        # that shows up in its first samples as the storage being slower than
-        # it is.
-        [ $first_test -eq 0 ] && test_settle
-        first_test=0
-        run_test "$mp" "$t"
-      done
-    done
-  else
-    first_unit=1
-    for t in "${TESTS[@]}"; do
-      log "$t"
+    if [ "$REPEATS" -gt 1 ]; then
+      log "pass $pass of $REPEATS ($RUN_ID)"
+      # The same cooldown that separates runs within a pass separates the
+      # passes themselves, so pass 2 does not start measuring while the
+      # backend is still flushing what pass 1 wrote.
+      [ "$pass" -gt 1 ] && settle
+    fi
+
+    if [ "$ORDER" = "by-mount" ]; then
+      first_mount=1
       for mp in "${USABLE[@]}"; do
-        # by-test already pauses between every (test, mount) unit, and SETTLE
-        # is longer than TEST_SETTLE would be, so there is nothing to add here.
-        [ $first_unit -eq 0 ] && settle
-        first_unit=0
-        info "-> $mp"
-        run_test "$mp" "$t"
+        [ $first_mount -eq 0 ] && {
+          log "cooldown between mounts"
+          settle
+        }
+        first_mount=0
+        log "$mp"
+        first_test=1
+        for t in "${TESTS[@]}"; do
+          # The gap between consecutive tests on one mount. Without it a test
+          # begins while the previous one's writeback is still in flight, and
+          # that shows up in its first samples as the storage being slower
+          # than it is.
+          [ $first_test -eq 0 ] && test_settle
+          first_test=0
+          run_test "$mp" "$t"
+        done
       done
-    done
-  fi
-done
+    else
+      first_unit=1
+      for t in "${TESTS[@]}"; do
+        log "$t"
+        for mp in "${USABLE[@]}"; do
+          # by-test already pauses between every (test, mount) unit, and
+          # SETTLE is longer than TEST_SETTLE would be, so there is nothing to
+          # add here.
+          [ $first_unit -eq 0 ] && settle
+          first_unit=0
+          info "-> $mp"
+          run_test "$mp" "$t"
+        done
+      done
+    fi
+  done
+fi
 
 ELAPSED=$(($(date +%s) - START_EPOCH))
+[ -n "$REPLOT_DIR" ] || ELAPSED_LABEL="${ELAPSED}s"
 
 # ---------------------------------------------------------------------------
 # Graphs
@@ -936,12 +1041,25 @@ DDIR_NAME=(read write)
 
 # Every test but pgbench is an fio job, and has been since dd left.
 FIO_TESTS=()
-for t in "${TESTS[@]}"; do
-  case "$t" in
-  pgbench) ;;
-  *) FIO_TESTS+=("$t") ;;
-  esac
-done
+if [ -n "$REPLOT_DIR" ]; then
+  # The subset the original run actually used, read from its own CSV rather
+  # than from today's FIO_TESTS environment variable — a --replot has no
+  # reason to see the same value that env var held when the run happened.
+  readarray -t _present < <(tail -n +2 "$FIO_CSV" | awk -F, '{print $3}' | sort -u)
+  for t in "${ALL_FIO_TESTS[@]}"; do
+    for p in "${_present[@]}"; do
+      [ "$t" = "$p" ] && FIO_TESTS+=("$t") && break
+    done
+  done
+  unset _present
+else
+  for t in "${TESTS[@]}"; do
+    case "$t" in
+    pgbench) ;;
+    *) FIO_TESTS+=("$t") ;;
+    esac
+  done
+fi
 
 # What each fio job is for, in the report's words. Kept next to nothing else on
 # purpose: the flags themselves are quoted from FIO_ARGS, which run_fio fills in
@@ -1106,84 +1224,52 @@ pgbench_series() { # <log prefix> <tps|lat|maxlat>
     }' "${files[@]}" | sort -n
 }
 
-# The gnuplot half of a chart, shared by the fio and pgbench plots so there is
-# one place where the terminal, the axes and the legend are decided. Each part
-# is a complete gnuplot `plot` element. Returns non-zero if given nothing.
-render_plot() { # <img> <gp> <title> <xlabel> <ylabel> <logscale> <part>...
-  local img="$1" gp="$2" desc="$3" xlabel="$4" ylabel="$5" logscale="$6"
-  shift 6
+# Draws one series onto a chart being built up in the caller's `parts` array,
+# as a tab-separated spec render_plot later splits into a per-series line in
+# render-chart.awk's META file: <datfile> <style> <colour index> <dash index>
+# <title>. style is band|dash|line — see render-chart.awk's header comment.
+plot_part() { # <datfile> <title> <band|dash|line> <colour index> [dash index]
+  printf '%s\t%s\t%s\t%s\t%s' "$1" "$3" "$4" "${5:-0}" "$2"
+}
+
+# One SVG for one chart, shared by the fio and pgbench plots so there is one
+# place where the axes, the legend and the interactivity are decided. Draws
+# with render-chart.awk rather than gnuplot: the graphs need to overlay a few
+# series of a few hundred samples each, which is comfortably inside plain
+# awk, and drawing them there means a hover tooltip — nearest-sample lookup
+# baked into a small embedded <script>, since a plot of this many points is a
+# poor fit for a `<title>` per point — instead of a static image, at no extra
+# runtime dependency: awk is already load-bearing for everything else this
+# script parses. Returns non-zero if given nothing.
+render_plot() { # <img> <title> <xlabel> <ylabel> <logscale> <part>...
+  local img="$1" desc="$2" xlabel="$3" ylabel="$4" logscale="$5"
+  shift 5
   local parts=("$@")
 
   [ ${#parts[@]} -eq 0 ] && return 1
 
-  # One element per line, joined with gnuplot's backslash continuation, rather
-  # than one long line. gnuplot stops parsing a command line somewhere past 2 KB
-  # — a plot of six series whose titles and data paths both carry a deep mount
-  # path reaches that — and the failure is a syntax error pointing at the
-  # truncation, having already written a partial SVG, so it does not even look
-  # like a length problem. It also makes the .gp files readable, which matters
-  # because the report invites people to re-run them.
-  local plotline="" p sep=""
+  # META pairs each data file with how to draw it. It sits right next to the
+  # SVG it drew, named to match, so the chart can be redrawn by hand:
+  #   awk -v META=foo.meta -v TITLE=... -f graphs/render-chart.awk *.dat
+  local meta="${img%.svg}.meta" datfiles=() p dat style ci di title
+  : >"$meta"
   for p in "${parts[@]}"; do
-    plotline="${plotline}${sep}${p}"
-    sep=", \\"$'\n'"     "
+    IFS=$'\t' read -r dat style ci di title <<<"$p"
+    datfiles+=("$dat")
+    printf '%s\t%s\t%s\t%s\n' "$style" "$ci" "$di" "$title" >>"$meta"
   done
 
-  # The legend sits below the plot, one entry per row, and the canvas grows to
-  # make room for the rows. It used to sit outside right, which gnuplot sizes by
-  # reserving space for the widest label — and the labels are mount paths. A
-  # short one costs nothing, but a PVC mounted somewhere deep took the plot from
-  # 917px of the 1100px canvas down to 245px, which is a tenth of the resolution
-  # for the same number of samples. Below the plot, the label length stops
-  # mattering: the same graph keeps ~1078px whatever the mounts are called.
-  #
-  # Only the parts that will appear in the legend earn a row. The aggregate
-  # plots draw a spread band behind each mean line, and those bands are
-  # `notitle` — counting them would leave a strip of empty canvas under every
-  # aggregate chart.
-  local legend=0 p
-  for p in "${parts[@]}"; do
-    case "$p" in
-    *notitle*) ;;
-    *) legend=$((legend + 1)) ;;
-    esac
-  done
-  local height=$((420 + 24 * legend))
+  # Every chart's ids are prefixed with a slug of its own path, so a report
+  # page that inlines dozens of these side by side — which it does, because a
+  # <script> inside an <img src="data:.."> never executes — never has one
+  # chart's ids collide with another's.
+  local uid
+  uid="$(slug "${img#"$PLOTDIR"/}")"
+  uid="${uid//[.\/]/-}"
 
-  # Everything emitted below is deliberately ASCII: the script runs under
-  # LC_ALL=C, where gnuplot's iconv cannot convert its own non-ASCII glyphs and
-  # warns once per plot.
-  {
-    # svg rather than pngcairo: the SVG terminal is built into gnuplot and needs
-    # no libraries at all, where pngcairo wants cairo, pango, glib, harfbuzz,
-    # freetype, fontconfig and a font — ~55 MB of image to rasterise a line
-    # chart the browser can draw itself. It also scales, which a 1100px PNG
-    # did not.
-    #
-    # The font is named generically because the image no longer carries one;
-    # whatever sans the viewer has is what the labels get. noenhanced: test
-    # names and mount paths are full of underscores, which gnuplot's enhanced
-    # text would render as subscripts. An explicit white background, because
-    # the SVG terminal otherwise leaves it transparent and the black axis text
-    # then disappears against a dark-mode page.
-    echo "set terminal svg noenhanced size 1100,$height font 'sans-serif,10' background rgb 'white'"
-    echo "set output '$img'"
-    echo "set title '$desc'"
-    echo "set xlabel '$xlabel'"
-    echo "set ylabel '$ylabel'"
-    echo "set grid xtics ytics lc rgb '#c8c8c8'"
-    echo "set key below maxcols 1"
-    echo "set xrange [0:*]"
-    if [ "$logscale" = 1 ]; then
-      echo "set logscale y"
-      echo "set format y '%.0s%c'"
-    else
-      echo "set yrange [0:*]"
-    fi
-    echo "plot $plotline"
-  } >"$gp"
-
-  gnuplot "$gp" 2>>"$PLOTDIR/gnuplot.log"
+  awk -v META="$meta" -v TITLE="$desc" -v XLABEL="$xlabel" -v YLABEL="$ylabel" \
+    -v LOGSCALE="$logscale" -v UID="$uid" \
+    -f "$RENDER_AWK" "${datfiles[@]}" >"$img" 2>>"$PLOTDIR/render.log"
   local rc=$?
 
   [ $rc -eq 0 ] && [ -s "$img" ]
@@ -1208,43 +1294,6 @@ aggregate_series() { # <dat>...
     END {
       for (t in s) printf "%.3f %.6f %.6f %.6f\n", t, s[t] / n[t], mn[t], mx[t]
     }' "$@" | sort -n
-}
-
-# gnuplot picks its own colours per plot element, which is fine when every
-# element is a line. The aggregates pair a band with a line and the two have to
-# match, so the colour is stated instead. These are gnuplot's own defaults,
-# which are already chosen to stay distinguishable.
-PLOT_COLORS=('#9400d3' '#009e73' '#56b4e9' '#e69f00' '#f0e442' '#0072b2' '#e51e10' '#000000')
-
-# The gnuplot elements for one series, returned in a global because they are
-# full of spaces and quotes and would not survive command substitution.
-#
-# A per-pass chart is one line. An aggregate is the min-max band across passes,
-# shaded, with the mean drawn over it — both in the same colour, so the pair
-# reads as one series rather than two. A wide band means the storage did not
-# do the same thing twice, which is the reason for running it more than once.
-PLOT_PARTS=()
-plot_parts() { # <datfile> <title> <band|dash|line> <colour index> [dash index]
-  local dat="$1" title="$2" style="$3" ci="$4" di="${5:-0}"
-  local color="${PLOT_COLORS[$((ci % ${#PLOT_COLORS[@]}))]}"
-  PLOT_PARTS=()
-  case "$style" in
-  band)
-    PLOT_PARTS+=("'$dat' using 1:3:4 with filledcurves fc rgb '$color' fs transparent solid 0.18 notitle")
-    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 lc rgb '$color' title '$title'")
-    ;;
-  dash)
-    # One colour per series, one dash pattern per pass, so the same series in
-    # different passes stays visibly the same series. Colouring by pass instead
-    # would run out of distinguishable colours as soon as there is more than one
-    # mount, and would make two unrelated lines look related.
-    # gnuplot's dashtypes: 1 solid, 2 dashed, 3 dotted, 4 dash-dot, 5 dash-dot-dot.
-    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 lc rgb '$color' dt $((di % 5 + 1)) title '$title'")
-    ;;
-  *)
-    PLOT_PARTS+=("'$dat' using 1:2 with lines lw 2 title '$title'")
-    ;;
-  esac
 }
 
 # One SVG for one (test, metric), overlaying every mount and direction that
@@ -1295,13 +1344,12 @@ plot_metric() { # <pass id> <test> <log-suffix> <key> <sum|avg> <scale> <ylabel>
         rm -f "$dat"
         continue
       fi
-      plot_parts "$dat" "$title" "$style" "$ci"
-      parts+=("${PLOT_PARTS[@]}")
+      parts+=("$(plot_part "$dat" "$title" "$style" "$ci")")
       ci=$((ci + 1))
     done
   done
 
-  render_plot "$outdir/${test}_${key}.svg" "$outdir/${test}_${key}.gp" \
+  render_plot "$outdir/${test}_${key}.svg" \
     "$desc - $test" "elapsed within the fio run (s)" "$ylabel" "$logscale" \
     "${parts[@]}"
 }
@@ -1342,12 +1390,11 @@ plot_pgbench() { # <pass id> <key> <tps|lat|maxlat> <ylabel> <title> <logscale>
       rm -f "$dat"
       continue
     fi
-    plot_parts "$dat" "$title" "$style" "$ci"
-    parts+=("${PLOT_PARTS[@]}")
+    parts+=("$(plot_part "$dat" "$title" "$style" "$ci")")
     ci=$((ci + 1))
   done
 
-  render_plot "$outdir/pgbench_${key}.svg" "$outdir/pgbench_${key}.gp" \
+  render_plot "$outdir/pgbench_${key}.svg" \
     "$desc - pgbench" "elapsed within the pgbench run (s)" "$ylabel" "$logscale" \
     "${parts[@]}"
 }
@@ -1391,8 +1438,7 @@ plot_compare() { # <base> <key> <ylabel> <title> <logscale>
         # The dash index still advances for a pass that produced nothing, so a
         # pass keeps the same dash pattern in every chart it appears in.
         if [ -s "$dat" ]; then
-          plot_parts "$dat" "$title" dash "$ci" "$di"
-          parts+=("${PLOT_PARTS[@]}")
+          parts+=("$(plot_part "$dat" "$title" dash "$ci" "$di")")
           drew=1
         fi
         di=$((di + 1))
@@ -1403,7 +1449,7 @@ plot_compare() { # <base> <key> <ylabel> <title> <logscale>
     done
   done
 
-  render_plot "$outdir/${base}_${key}.svg" "$outdir/${base}_${key}.gp" \
+  render_plot "$outdir/${base}_${key}.svg" \
     "$desc - $base, every pass" "$xlabel" "$ylabel" "$logscale" "${parts[@]}"
 }
 
@@ -1411,8 +1457,328 @@ pgbench_graphed=0
 cmp_graphed=0
 agg_graphed=0
 
-if [ "$have_gnuplot" = 1 ]; then
+if [ "$have_plot" = 1 ]; then
   log "Drawing graphs"
+
+  # Materialised once per run rather than shipped as its own file: the image
+  # is deliberately one script (see default.nix), and this keeps it that way
+  # while still leaving a real, standalone .awk file under graphs/ that the
+  # report can point people at to redraw a chart by hand.
+  RENDER_AWK="$PLOTDIR/render-chart.awk"
+  cat >"$RENDER_AWK" <<'AWKEOF'
+#!/usr/bin/awk -f
+# render-chart.awk — draws one interactive SVG line/band chart from the
+# reduced "time value" series storage-bench.sh's fio_series/pgbench_series
+# leave behind, in the same spirit as storage-chaos.sh's hand-rolled charts:
+# no gnuplot, no rasteriser, nothing but awk and the browser's own SVG
+# renderer.
+#
+# gnuplot's static SVG terminal cannot answer on hover, and a plain per-point
+# <title> (which is all storage-chaos needs, for its couple of dozen discrete
+# events) does not suit a few hundred samples on a line — so this bakes the
+# series into a small embedded <script> that finds the nearest sample under
+# the cursor and draws a crosshair + tooltip. No network fetch, no external
+# library.
+#
+# Invocation:
+#   awk -v META=<meta-file> -v TITLE=.. -v XLABEL=.. -v YLABEL=.. \
+#       -v LOGSCALE=0|1 -v UID=<chart-unique-id-prefix> \
+#       -f render-chart.awk file1.dat file2.dat ... > out.svg
+#
+# META has one tab-separated line per data file, in the same order:
+#   style<TAB>colour-index<TAB>dash-index<TAB>title
+# style is one of:
+#   band   file has 4 columns "t mean min max" — a shaded min-max band with
+#          the mean drawn over it (what REPEATS>1 aggregates use)
+#   line   file has 2 columns "t v" — a plain solid line (one pass, no band)
+#   dash   file has 2 columns "t v" — a dashed line, dash pattern by
+#          dash-index (what the "every pass on one axis" compare charts use)
+#
+# UID prefixes every element id this chart defines, so a report page that
+# inlines many of these charts side by side (which it does, precisely so the
+# embedded <script> tags run at all — a script inside an <img src="data:..">
+# does not execute) never has one chart's ids collide with another's.
+
+function esc(s) {
+  gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s)
+  return s
+}
+
+# Escapes for a double-quoted JS string literal embedded inside the <script>.
+function jsesc(s) {
+  gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s)
+  gsub(/\n/, " ", s)
+  return s
+}
+
+# Tick spacing and time labels, straight out of storage-chaos.sh's AWK_NICE —
+# same round 1/2/5x10^n steps, same "past 90s, switch to minutes" rule, so a
+# long fio run reads the same way a long chaos run does instead of one being
+# "612.0" seconds while the other says "10m".
+function nice_step(range, want,   raw, mag, r) {
+  raw = range / want
+  if (raw <= 0) return 1
+  mag = 1
+  while (mag > raw) mag /= 10
+  while (mag * 10 <= raw) mag *= 10
+  r = raw / mag
+  return (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 5 ? 5 : 10))) * mag
+}
+# Decimals appropriate to a step: 0.1 wants one, 5 wants none.
+function fmt(v, step) {
+  return (step >= 1 ? sprintf("%d", v + 0.0001) :
+         (step >= 0.1 ? sprintf("%.1f", v) : sprintf("%.2f", v)))
+}
+function hms(t) { return (t >= 90 ? sprintf("%dm", int(t / 60)) : sprintf("%ds", int(t))) }
+
+# gnuplot's own default line colours — kept so a chart drawn today still
+# looks like one drawn yesterday. Distinguishable in both light and dark.
+function color(ci,   c) {
+  c = ci % 6
+  if (c == 0) return "#9400d3"
+  if (c == 1) return "#009e73"
+  if (c == 2) return "#56b4e9"
+  if (c == 3) return "#e69f00"
+  if (c == 4) return "#0072b2"
+  return "#e51e10"
+}
+
+# gnuplot's own dashtypes: 1 solid, 2 dashed, 3 dotted, 4 dash-dot, 5
+# dash-dot-dot. di 0 here is deliberately the first *non-solid* pattern —
+# style "dash" is only ever used to tell passes apart on a chart that already
+# has one solid "line"/"band" series per colour elsewhere, so a dashed series
+# starting at "solid" would be indistinguishable from a line one.
+function dasharray(di,   d) {
+  d = di % 5
+  if (d == 0) return "6 3"
+  if (d == 1) return "2 2"
+  if (d == 2) return "1 3"
+  if (d == 3) return "8 2 2 2"
+  return "8 2 1 2 1 2"
+}
+
+function id(s) { return UID "-" s }
+
+BEGIN {
+  if (LOGSCALE == "") LOGSCALE = 0
+  if (UID == "") UID = "c"
+
+  nfiles = 0
+  while ((getline mline < META) > 0) {
+    nfiles++
+    split(mline, mf, "\t")
+    mstyle[nfiles] = mf[1]; mci[nfiles] = mf[2] + 0
+    mdi[nfiles] = mf[3] + 0; mtitle[nfiles] = mf[4]
+  }
+  close(META)
+}
+
+FNR == 1 { curf++ }
+
+{
+  n = npts[curf] + 1
+  npts[curf] = n
+  t[curf, n] = $1 + 0
+  if (mstyle[curf] == "band") {
+    mean[curf, n] = $2 + 0; lo[curf, n] = $3 + 0; hi[curf, n] = $4 + 0
+    yv1 = lo[curf, n]; yv2 = hi[curf, n]
+  } else {
+    v[curf, n] = $2 + 0
+    yv1 = v[curf, n]; yv2 = yv1
+  }
+  if (!xseen || $1 + 0 > xmax) { xmax = $1 + 0; xseen = 1 }
+  if (!yseen || yv2 > ymax) { ymax = yv2; yseen = 1 }
+  if (!yminseen || yv1 < ymin) { ymin = yv1; yminseen = 1 }
+}
+
+END {
+  if (curf == 0 || nfiles == 0) {
+    print "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>"
+    exit
+  }
+
+  W = 1100; L = 76; R = 30
+  TOP = 40; PLOTH = 340; XAXISH = 44
+  LEGROWH = 18
+  LEGH = 12 + LEGROWH * nfiles + 8
+  H = TOP + PLOTH + XAXISH + LEGH
+  X = W - R
+  PB = TOP + PLOTH # plot bottom
+
+  xmin = 0
+  if (xmax <= xmin) xmax = xmin + 1
+  xr = xmax - xmin
+
+  if (LOGSCALE == 1) {
+    if (ymin <= 0) ymin = 1e-9
+    lymin = log(ymin) / log(10); lymax = log(ymax) / log(10)
+    if (lymax <= lymin) lymax = lymin + 1
+  } else {
+    ymin = 0
+    if (ymax <= 0) ymax = 1
+    yr = ymax - ymin
+  }
+
+  printf "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\" width=\"100%%\" font-family=\"system-ui, sans-serif\" font-size=\"12\">\n", W, H
+  printf "<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#ffffff\"/>\n", W, H
+  printf "<style>#%s .xhair{stroke:#9a9892;stroke-width:1;display:none} #%s .tip{display:none}</style>\n", UID, UID
+  printf "<g id=\"%s\">\n", UID
+  printf "<text x=\"%d\" y=\"22\" text-anchor=\"middle\" font-size=\"14\" font-weight=\"600\" fill=\"#1c1b1a\">%s</text>\n", W / 2, esc(TITLE)
+  printf "<text x=\"%d\" y=\"%d\" text-anchor=\"middle\" fill=\"#52514e\">%s</text>\n", L + (X - L) / 2, PB + XAXISH - 6, esc(XLABEL)
+  printf "<text x=\"16\" y=\"%d\" text-anchor=\"middle\" fill=\"#52514e\" transform=\"rotate(-90 16 %d)\">%s</text>\n", TOP + PLOTH / 2, TOP + PLOTH / 2, esc(YLABEL)
+
+  # y gridlines
+  if (LOGSCALE == 1) {
+    e0 = int(lymin); if (e0 > lymin) e0--
+    e1 = int(lymax); if (e1 < lymax) e1++
+    step = 1
+    if (e1 - e0 > 6) step = int((e1 - e0 + 5) / 6)
+    for (e = e0; e <= e1; e += step) {
+      yv = e
+      if (yv < lymin || yv > lymax) continue
+      py = PB - PLOTH * (yv - lymin) / (lymax - lymin)
+      printf "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"#e5e4e0\"/>\n", L, py, X, py
+      printf "<text x=\"%d\" y=\"%.1f\" text-anchor=\"end\" fill=\"#52514e\">%s</text>\n", L - 8, py + 4, si(exp(e * log(10)))
+    }
+  } else {
+    ystep = nice_step(yr, 5)
+    for (yv = 0; yv <= ymax + ystep / 1000; yv += ystep) {
+      py = PB - PLOTH * (yv - ymin) / yr
+      printf "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"#e5e4e0\"/>\n", L, py, X, py
+      printf "<text x=\"%d\" y=\"%.1f\" text-anchor=\"end\" fill=\"#52514e\">%s</text>\n", L - 8, py + 4, fmt(yv, ystep)
+    }
+  }
+
+  # x gridlines — same round steps and the same seconds/minutes switch as
+  # storage-chaos.sh's timeline, so the two reports read the same way.
+  xstep = nice_step(xr, 6)
+  for (xv = 0; xv <= xmax + xstep / 1000; xv += xstep) {
+    px = L + (X - L) * (xv - xmin) / xr
+    printf "<line x1=\"%.1f\" y1=\"%d\" x2=\"%.1f\" y2=\"%d\" stroke=\"#e5e4e0\"/>\n", px, TOP, px, PB
+    printf "<text x=\"%.1f\" y=\"%d\" text-anchor=\"middle\" fill=\"#52514e\">%s</text>\n", px, PB + 18, hms(xv)
+  }
+
+  printf "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"none\" stroke=\"#c8c6c0\"/>\n", L, TOP, X - L, PLOTH
+
+  # series
+  jsdata = ""
+  for (f = 1; f <= nfiles; f++) {
+    c = color(mci[f])
+    if (mstyle[f] == "band") {
+      poly = ""
+      for (p = 1; p <= npts[f]; p++) poly = poly sprintf("%.1f,%.1f ", px_of(t[f, p]), py_of(hi[f, p]))
+      for (p = npts[f]; p >= 1; p--) poly = poly sprintf("%.1f,%.1f ", px_of(t[f, p]), py_of(lo[f, p]))
+      printf "<polygon points=\"%s\" fill=\"%s\" fill-opacity=\"0.16\" stroke=\"none\"/>\n", poly, c
+      line = ""
+      for (p = 1; p <= npts[f]; p++) line = line sprintf("%.1f,%.1f ", px_of(t[f, p]), py_of(mean[f, p]))
+      printf "<polyline points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"2\"/>\n", line, c
+      jsdata = jsdata "{\"c\":\"" c "\",\"t\":\"" jsesc(mtitle[f]) "\",\"band\":1,\"p\":["
+      for (p = 1; p <= npts[f]; p++)
+        jsdata = jsdata sprintf("[%.3f,%.6f,%.6f,%.6f],", t[f, p], mean[f, p], lo[f, p], hi[f, p])
+      jsdata = jsdata "]},"
+    } else {
+      line = ""
+      for (p = 1; p <= npts[f]; p++) line = line sprintf("%.1f,%.1f ", px_of(t[f, p]), py_of(v[f, p]))
+      da = (mstyle[f] == "dash") ? " stroke-dasharray=\"" dasharray(mdi[f]) "\"" : ""
+      printf "<polyline points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"%s\"%s/>\n", \
+        line, c, (mstyle[f] == "dash" ? "1.5" : "2"), da
+      jsdata = jsdata "{\"c\":\"" c "\",\"t\":\"" jsesc(mtitle[f]) "\",\"band\":0,\"p\":["
+      for (p = 1; p <= npts[f]; p++) jsdata = jsdata sprintf("[%.3f,%.6f],", t[f, p], v[f, p])
+      jsdata = jsdata "]},"
+    }
+  }
+  sub(/,$/, "", jsdata)
+
+  # legend, one row per series, below the plot rather than beside it — a
+  # legend to the right sizes its reserved column by the widest label, and the
+  # labels are mount paths; below, a long one costs a line, not a third of the
+  # canvas.
+  ly = PB + XAXISH + 8
+  for (f = 1; f <= nfiles; f++) {
+    c = color(mci[f])
+    row = ly + (f - 1) * LEGROWH
+    if (mstyle[f] == "dash")
+      printf "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"%s\" stroke-width=\"2\" stroke-dasharray=\"%s\"/>\n", \
+        L, row - 4, L + 16, row - 4, c, dasharray(mdi[f])
+    else
+      printf "<rect x=\"%d\" y=\"%d\" width=\"16\" height=\"3\" fill=\"%s\"/>\n", L, row - 6, c
+    printf "<text x=\"%d\" y=\"%d\" fill=\"#3a3937\">%s</text>\n", L + 22, row, esc(mtitle[f])
+  }
+
+  # crosshair + tooltip, driven by the embedded script below
+  printf "<line class=\"xhair\" id=\"%s\" x1=\"0\" y1=\"%d\" x2=\"0\" y2=\"%d\"/>\n", id("xh"), TOP, PB
+  printf "<g class=\"tip\" id=\"%s\"><rect id=\"%s\" width=\"10\" height=\"10\" rx=\"4\" fill=\"#1c1b1a\" fill-opacity=\"0.92\"/><text id=\"%s\" x=\"8\" y=\"16\" fill=\"#fcfcfb\" font-size=\"11\"></text></g>\n", \
+    id("tip"), id("tipr"), id("tipt")
+  printf "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"transparent\" id=\"%s\"/>\n", L, TOP, X - L, PLOTH, id("hit")
+  print "</g>"
+
+  printf "<script><![CDATA[\n"
+  printf "(function(){\n"
+  printf "var root=document.getElementById(%s);if(!root)return;\n", jq(UID)
+  printf "var svg=root.closest('svg');\n"
+  printf "var S=[%s];\n", jsdata
+  printf "var L=%d,X=%d,TOP=%d,PB=%d,xmin=%.6f,xr=%.6f;\n", L, X, TOP, PB, xmin, xr
+  printf "var hit=root.querySelector('#%s'),xh=root.querySelector('#%s'),tip=root.querySelector('#%s'),tt=root.querySelector('#%s'),tr=root.querySelector('#%s');\n", \
+    id("hit"), id("xh"), id("tip"), id("tipt"), id("tipr")
+  print "function nearest(pts,tt2){var lo=0,hi=pts.length-1;if(hi<0)return -1;while(hi-lo>1){var m=(lo+hi)>>1;if(pts[m][0]<tt2)lo=m;else hi=m;}return Math.abs(pts[lo][0]-tt2)<Math.abs(pts[hi][0]-tt2)?lo:hi;}"
+  print "hit.addEventListener('mousemove',function(ev){"
+  print "  var r=svg.getBoundingClientRect();var scale=svg.viewBox.baseVal.width/r.width;"
+  print "  var px=(ev.clientX-r.left)*scale;"
+  print "  var tval=xmin+xr*(px-L)/(X-L);if(tval<xmin)tval=xmin;if(tval>xmin+xr)tval=xmin+xr;"
+  print "  var lines=[{c:'#9a9892',txt:'+'+hms_exact(tval)}];"
+  print "  for(var i=0;i<S.length;i++){var s=S[i];var j=nearest(s.p,tval);if(j<0)continue;var d=s.p[j];"
+  print "    var txt=s.t+': '+fmtv(d[1]);if(s.band)txt+=' ['+fmtv(d[2])+'-'+fmtv(d[3])+']';"
+  print "    lines.push({c:s.c,txt:txt});}"
+  print "  if(lines.length<=1)return;"
+  print "  xh.style.display='block';xh.setAttribute('x1',px);xh.setAttribute('x2',px);"
+  print "  while(tt.firstChild)tt.removeChild(tt.firstChild);"
+  print "  var w=90;"
+  print "  for(var k=0;k<lines.length;k++){"
+  print "    var tsp=document.createElementNS('http://www.w3.org/2000/svg','tspan');"
+  print "    tsp.setAttribute('x','20');tsp.setAttribute('y',16+k*15);tsp.textContent=lines[k].txt;"
+  print "    if(lines[k].txt.length*6+26>w)w=lines[k].txt.length*6+26;"
+  print "    tt.appendChild(tsp);"
+  print "    var sw=document.createElementNS('http://www.w3.org/2000/svg','rect');"
+  print "    sw.setAttribute('x',8);sw.setAttribute('y',8+k*15);sw.setAttribute('width',8);sw.setAttribute('height',8);sw.setAttribute('fill',lines[k].c);"
+  print "    tt.appendChild(sw);"
+  print "  }"
+  print "  var th=10+lines.length*15+6;tr.setAttribute('width',w);tr.setAttribute('height',th);"
+  print "  var tx=Math.min(px+10,X-w-2),ty=TOP+6;"
+  print "  tip.setAttribute('transform','translate('+tx+','+ty+')');tip.style.display='block';"
+  print "});"
+  print "hit.addEventListener('mouseleave',function(){xh.style.display='none';tip.style.display='none';});"
+  print "function fmtv(v){var a=Math.abs(v);if(a>=1000)return v.toFixed(0);if(a>=10)return v.toFixed(1);return v.toFixed(2);}"
+  # The axis ticks round to whole minutes past 90s, same as storage-chaos.sh's
+  # hms() — but a hover is a request for precision the rounded axis gave up,
+  # same as chaos's own tooltips (\"killed at +45s\", never \"+1m\"), so this
+  # keeps the sub-second reading intact instead of re-rounding it.
+  print "function hms_exact(t){if(t<90)return t.toFixed(1)+'s';var m=Math.floor(t/60);return m+'m '+(t-m*60).toFixed(1)+'s';}"
+  print "})();"
+  printf "]]></script>\n"
+  print "</svg>"
+}
+
+function jq(s) { return "\"" s "\"" }
+
+function px_of(tv) { return L + (X - L) * (tv - xmin) / xr }
+
+function py_of(yv) {
+  if (LOGSCALE == 1) {
+    if (yv <= 0) yv = ymin
+    return PB - PLOTH * (log(yv) / log(10) - lymin) / (lymax - lymin)
+  }
+  return PB - PLOTH * (yv - ymin) / yr
+}
+
+# SI-suffixed tick label for the log axis: gnuplot's `set format y '%.0s%c'`.
+function si(v,   av, u, i) {
+  av = v; i = 0
+  while (av >= 1000 && i < 4) { av /= 1000; i++ }
+  u = (i == 0 ? "" : (i == 1 ? "k" : (i == 2 ? "M" : (i == 3 ? "G" : "T"))))
+  if (av == int(av)) return sprintf("%d%s", av, u)
+  return sprintf("%.1f%s", av, u)
+}
+AWKEOF
 
   # Per pass first, then the aggregate, which reads the per-pass data files the
   # first loop wrote. With REPEATS=1 the aggregate would be the same chart drawn
@@ -1527,7 +1893,7 @@ HEADLINE_SUFFIX=""
 HEADLINE_GRAPH_NOTE=""
 
 # Whether a pass actually produced charts. RUN_IDS has an entry for every pass
-# whether or not gnuplot ever ran, so its length cannot answer this: with PLOT=0
+# whether or not drawing ever ran, so its length cannot answer this: with PLOT=0
 # it is still one-per-pass, and taking the first entry as the headline on that
 # basis left the report with no charts and — because the "no charts, and here is
 # why" note is written only when there is no headline — nothing saying so.
@@ -1587,8 +1953,8 @@ log "Writing report"
 
 | Property | Value |
 | -------- | ----- |
-| Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
-| Total runtime     | ${ELAPSED}s |
+| Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC')$([ -n "$REPLOT_DIR" ] && echo " (--replot)") |
+| Total runtime     | ${ELAPSED_LABEL} |
 | Host / pod        | $(uname -n) |
 | Kernel            | $(uname -r) |
 | Running as        | uid $(id -u), gid $(id -g) |
@@ -1844,13 +2210,12 @@ EOF
 
   if [ -z "$HEADLINE_GRAPHS" ]; then
     echo
-    if [ "$have_gnuplot" = 1 ]; then
+    if [ "$have_plot" = 1 ]; then
       echo "No time-series samples were produced — every fio job failed, or the"
       echo "runs were shorter than one ${LOG_AVG_MSEC}ms sample window."
     else
-      echo "Graphs were skipped: gnuplot is not available in this image, or"
-      echo "\`PLOT=0\` was set. The underlying logs are still under \`fio-logs/\`"
-      echo "and can be plotted after the fact."
+      echo "Graphs were skipped: \`PLOT=0\` was set. The underlying logs are"
+      echo "still under \`fio-logs/\` and can be plotted after the fact."
     fi
     echo
   fi
@@ -1884,16 +2249,41 @@ fio's standard log format, so \`fio2gnuplot\` and \`fiologparser.py\` will read 
 if you want to re-plot them differently. Neither ships in this image — both are
 Python, and CPython is most of what a benchmark image would otherwise carry.
 
-\`graphs/<pass>/\` holds the rendered SVGs alongside the gnuplot script that drew
-each one, and \`graphs/data/<pass>/\` the reduced series they were drawn from, so
-any plot can be tweaked and redrawn without re-running the benchmark:
+\`graphs/<pass>/\` holds the rendered SVGs, each alongside the \`.meta\` file that
+says how it was drawn — which series, in which colour, band or dashed — and
+\`graphs/data/<pass>/\` the reduced series themselves, so any chart can be
+redrawn without re-running the benchmark:
 
 \`\`\`console
-\$ gnuplot graphs/${HEADLINE_GRAPHS:-run-01}/rand_read_4k_iops.gp
+\$ awk -v META=graphs/${HEADLINE_GRAPHS:-run-01}/rand_read_4k_iops.meta \\
+    -v TITLE="IOPS over time" -v XLABEL="elapsed (s)" -v YLABEL=IOPS \\
+    -f graphs/render-chart.awk graphs/data/${HEADLINE_GRAPHS:-run-01}/*rand_read_4k_iops_read.dat \\
+    > rand_read_4k_iops.svg
 \`\`\`
+
+\`graphs/render-chart.awk\` is the one script that drew every chart in this
+report — it needs nothing but awk, and it is what \`--replot\` (see below) reruns
+against the reduced series to rebuild the graphs and the report without
+touching fio or pgbench again.
 
 The aggregate charts are in \`graphs/aggregate/\`, drawn from
 \`graphs/data/aggregate_*.dat\`, whose columns are \`time mean min max\`.
+
+### Regenerating this report
+
+Everything the report and the graphs are built from — the CSVs, the fio and
+pgbench logs, the reduced \`.dat\` series — is still here. To redraw the graphs
+and rebuild the Markdown/HTML from them, without repeating the benchmark
+itself:
+
+\`\`\`console
+\$ ./storage-bench.sh --replot $OUTDIR
+\`\`\`
+
+This is also how a change to \`storage-bench.sh\`'s drawing or reporting code is
+tried out against a real run: point \`--replot\` at any \`bench-results-*\`
+directory, including one from an older version of the script, and only the
+graphs and report are touched.
 MDEOF
 } >"$MD"
 
@@ -1908,13 +2298,17 @@ MDEOF
 # things it does not do are done below instead.
 #
 # The result is one self-contained file: the stylesheet is embedded and every
-# graph is inlined as a data: URI, so the HTML can be mailed or copied out of a
-# pod on its own without dragging graphs/ along with it.
+# graph's SVG markup is spliced in directly, so the HTML can be mailed or
+# copied out of a pod on its own without dragging graphs/ along with it. Inline
+# rather than a data: URI, as an <img> once held: a chart's hover tooltip is a
+# <script> baked into its SVG (see render-chart.awk), and a script inside an
+# <img src="data:image/svg+xml..."> never runs — the browser treats an <img>'s
+# SVG as a static image regardless of what is inside it.
 # ---------------------------------------------------------------------------
 
 # The page shell. Light and dark are both styled because this is read in a
-# browser, but graph figures keep a white plate in either: the SVGs gnuplot
-# writes have a hard-coded white background (see plot_metric) and black axis
+# browser, but graph figures keep a white plate in either: the SVGs
+# render-chart.awk draws have a hard-coded white background and dark axis
 # text, so they need one.
 html_head() {
   cat <<'MDEOF'
@@ -1994,7 +2388,7 @@ code { background: var(--code-bg); border-radius: 3px; padding: 0.1em 0.2em;
        font-size: 0.875em; }
 
 figure { margin: 0 0 1.75rem; }
-figure img {
+figure img, figure svg {
   display: block; width: 100%; height: auto; background: #fff;
   border: 1px solid var(--rule); border-radius: 4px; padding: 0.25rem;
 }
@@ -2013,16 +2407,8 @@ html_foot() {
 # section numbers, a table of contents, and inlined images. Everything is held
 # in memory because the contents page has to be printed before the body it was
 # built from; the fragment is a few hundred KiB, the graphs are not in it yet.
-decorate() { # <data-uri map>
-  awk -v mapfile="$1" '
-    BEGIN {
-      while ((getline ln < mapfile) > 0) {
-        i = index(ln, "\t")
-        if (i > 0) uri[substr(ln, 1, i - 1)] = substr(ln, i + 1)
-      }
-      close(mapfile)
-    }
-
+decorate() { # <base dir the markdown's graphs/... image paths are relative to>
+  awk -v basedir="$1" '
     # Anchors are GitHub-compatible — lowercased, punctuation dropped, spaces
     # hyphenated, duplicates suffixed -1, -2 — so the intra-document links in
     # the Markdown resolve both here and when the .md is viewed on a forge.
@@ -2037,11 +2423,6 @@ decorate() { # <data-uri map>
       sub(/^-/, "", t)
       sub(/-$/, "", t)
       return t
-    }
-    function inline_uris(s,   k) {
-      if (!index(s, "src=\"graphs/")) return s
-      for (k in uri) gsub("src=\"" k "\"", "src=\"" uri[k] "\"", s)
-      return s
     }
 
     { line[++n] = $0 }
@@ -2088,7 +2469,11 @@ decorate() { # <data-uri map>
         }
 
         # A paragraph containing nothing but an image becomes a captioned
-        # figure, with the alt text serving as the caption.
+        # figure, with the alt text serving as the caption, and the image
+        # itself — always one of our own charts — is spliced in as real SVG
+        # markup rather than left as an <img src="graphs/...">: the hover
+        # tooltip on every chart is a <script> baked into its SVG, and a
+        # script inside an <img>, data: URI or not, never runs.
         if (l ~ /^<p><img [^>]*\/><\/p>$/) {
           img = l
           sub(/^<p>/, "", img)
@@ -2096,7 +2481,19 @@ decorate() { # <data-uri map>
           alt = ""
           if (match(img, /alt="[^"]*"/))
             alt = substr(img, RSTART + 5, RLENGTH - 6)
-          print "<figure>" inline_uris(img) \
+          src = ""
+          if (match(img, /src="[^"]*"/))
+            src = substr(img, RSTART + 5, RLENGTH - 6)
+
+          svg = ""
+          if (src != "") {
+            fpath = basedir "/" src
+            while ((getline sline < fpath) > 0) svg = svg sline "\n"
+            close(fpath)
+          }
+          if (svg == "") svg = "<p><em>[graph missing: " src "]</em></p>"
+
+          print "<figure>" svg \
             (alt == "" ? "" : "<figcaption>" alt "</figcaption>") "</figure>"
           continue
         }
@@ -2106,7 +2503,7 @@ decorate() { # <data-uri map>
         if (l == "<table>") { print "<div class=\"tablewrap\">"; print l; continue }
         if (l == "</table>") { print l; print "</div>"; continue }
 
-        print inline_uris(l)
+        print l
       }
       print "</main>"
     }
@@ -2114,36 +2511,15 @@ decorate() { # <data-uri map>
 }
 
 render_html() { # <markdown> <html out>
-  local md="$1" out="$2"
-  local map="$MOUNTINFO/graph-data-uri.map" f rel rc
-
-  # base64 rather than inlining the SVG markup: gnuplot gives every plot the
-  # same element ids, and a dozen inline <svg> blocks sharing one id space would
-  # have each of them resolve its <defs> references to the first plot on the
-  # page. A data: URI keeps each graph in its own document, as a separate file
-  # would have.
-  #
-  # The SVGs live one directory down, under the pass that drew them, so the key
-  # has to be the path relative to OUTDIR — which is what the Markdown refers to
-  # them by — rather than just the basename. Every pass names its charts
-  # identically, so a basename key would collide and every pass would show the
-  # first pass's graphs.
-  : >"$map"
-  for f in "$PLOTDIR"/*/*.svg; do
-    [ -f "$f" ] || continue
-    rel="${f#"$OUTDIR"/}"
-    printf '%s\t%s\n' "$rel" \
-      "data:image/svg+xml;base64,$(base64 -w0 "$f")" >>"$map"
-  done
+  local md="$1" out="$2" rc
 
   {
     html_head
-    cmark-gfm --unsafe -e table -e autolink "$md" | decorate "$map"
+    cmark-gfm --unsafe -e table -e autolink "$md" | decorate "$OUTDIR"
     html_foot
   } >"$out"
   rc=$?
 
-  rm -f "$map"
   return $rc
 }
 
@@ -2211,13 +2587,17 @@ if [ "$ARCHIVE" = "1" ]; then
 fi
 
 echo
-echo "Done in ${ELAPSED}s."
+if [ -n "$REPLOT_DIR" ]; then
+  echo "Replotted in ${ELAPSED}s."
+else
+  echo "Done in ${ELAPSED}s."
+fi
 [ -n "$ARCHIVE_PATH" ] && echo "  Archive  : $ARCHIVE_PATH"
 echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
 echo "  CSVs     : $FIO_CSV"
 [ "$have_pgbench" = 1 ] && echo "             $PG_CSV"
-if [ "$have_gnuplot" = 1 ]; then
+if [ "$have_plot" = 1 ]; then
   echo "  Graphs   : $PLOTDIR/"
 fi
 echo "  fio logs : $LOGDIR/"
