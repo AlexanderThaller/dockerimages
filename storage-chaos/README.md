@@ -227,6 +227,14 @@ chaos-<timestamp>/
 └── report.html    all of the above, rendered — this is the one to read
 ```
 
+`./storage-chaos.sh --replot <dir>` rebuilds the charts and the report from a
+run's own `events.csv`, `config.env` and `plan.txt`, without touching a
+cluster — for trying a change to the charts or the report against a real run,
+or for rendering the report a first run skipped (`REPORT=none`, or `cmark-gfm`
+missing at the time). An environment variable set alongside `--replot` still
+wins over the run's own `config.env`, e.g. `REPORT=html ./storage-chaos.sh
+--replot <dir>` out of a run that used `REPORT=md`.
+
 ### The four charts
 
 No single chart survives every run length, so the report carries four views of

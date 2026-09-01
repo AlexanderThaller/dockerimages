@@ -10,6 +10,9 @@
 #   ./storage-chaos.sh openshift-storage portworx        # both at once
 #   MODE=random SEED=7 ./storage-chaos.sh openshift-storage
 #   INCLUDE='^rook-ceph-osd-' ./storage-chaos.sh openshift-storage
+#   ./storage-chaos.sh --replot <dir>                    # redraw a past run's
+#                                                         # charts and report,
+#                                                         # no cluster needed
 #
 # The intended shape of a run is two containers side by side: storage-bench
 # measuring a PVC on each provider, this one deleting the pods underneath it.
@@ -256,6 +259,16 @@ Output — one directory per run, under OUTBASE:
   histogram.svg distribution of recovery times, overall and per component
   timeline.svg  one lane per component, kills and recoveries along time
   report.html   all of the above, rendered — this is the one to read
+
+Replotting:
+  storage-chaos.sh --replot <dir>
+    Rebuilds the charts and the report from a previous run's own events.csv,
+    config.env and plan.txt, without touching a cluster — for trying a change
+    to the drawing or reporting code against a real run, or for rendering a
+    report that REPORT=none (or a missing cmark-gfm) skipped the first time.
+    An environment variable set alongside --replot still wins over the run's
+    own config.env, so REPORT=html storage-chaos.sh --replot <dir> renders
+    html out of a run that used REPORT=md. Needs no cluster access at all.
 
 Needs a ServiceAccount that may get, list and delete pods in the target
 namespaces. Out of cluster it uses KUBECONFIG; in cluster it finds the mounted
@@ -1624,22 +1637,16 @@ HEADEOF
   } >"$2"
 }
 
-finish() {
-  local end_iso end_ns span TIMELINE_NOTE
-  now
-  end_iso="$NOW_ISO" end_ns="$NOW_NS"
-  span="$(((end_ns - START_NS) / 1000000000))"
-  event "$end_iso" "$end_ns" "$ROUND" run-stop "" "" "" "" "" \
-    "${STOP_REASON:-completed}; killed=$KILLS skipped=$SKIPS failed=$FAILURES"
-
-  log "Done"
-  info "$([ "$DRY_RUN" -eq 1 ] && echo "would have killed" || echo "killed") $KILLS, skipped $SKIPS, failed $FAILURES, over ${span}s"
-  info "events: $EVENTS"
-
-  [ "$REPORT" = none ] && return 0
+# Draws the four charts and writes report.md (and report.html, if REPORT is
+# html) from a run's events.csv — shared by finish() and --replot, so a live
+# run and a replotted one can never draw a chart differently. Reads $KILLS
+# and $OUTDIR/$TMP as set by the caller, same as report_md and the *_svg
+# functions already did before this was split out.
+write_report() { # <events.csv> <end iso> <span seconds>
+  local events="$1" end_iso="$2" span="$3" TIMELINE_NOTE=""
 
   # Paired once; all three charts read it.
-  pair_kills "$EVENTS" "$span" >"$TMP/pairs"
+  pair_kills "$events" "$span" >"$TMP/pairs"
   timeline_svg "$TMP/pairs" "$span" >"$OUTDIR/timeline.svg"
   heatmap_svg "$TMP/pairs" "$span" >"$OUTDIR/heatmap.svg"
   recovery_svg "$TMP/pairs" "$span" >"$OUTDIR/recovery.svg"
@@ -1649,7 +1656,6 @@ finish() {
   # merge and the bars go sub-pixel. It is still drawn, because nothing else
   # shows the individual events, but the report says so rather than leaving
   # someone to squint at it and wonder whether it is broken.
-  TIMELINE_NOTE=""
   if [ "$KILLS" -gt 50 ]; then
     TIMELINE_NOTE="
 **$KILLS kills is past what this chart can show.** The marks merge and each bar
@@ -1658,7 +1664,7 @@ long. This one is kept for the hover text, which still names every pod.
 "
   fi
 
-  report_md "$EVENTS" "$end_iso" "$span" >"$OUTDIR/report.md"
+  report_md "$events" "$end_iso" "$span" >"$OUTDIR/report.md"
   info "report: $OUTDIR/report.md"
 
   if [ "$REPORT" = html ]; then
@@ -1669,6 +1675,21 @@ long. This one is kept for the hover text, which still names every pod.
       warn "cmark-gfm not on PATH — the report stays as Markdown"
     fi
   fi
+}
+
+finish() {
+  local end_iso end_ns span
+  now
+  end_iso="$NOW_ISO" end_ns="$NOW_NS"
+  span="$(((end_ns - START_NS) / 1000000000))"
+  event "$end_iso" "$end_ns" "$ROUND" run-stop "" "" "" "" "" \
+    "${STOP_REASON:-completed}; killed=$KILLS skipped=$SKIPS failed=$FAILURES"
+
+  log "Done"
+  info "$([ "$DRY_RUN" -eq 1 ] && echo "would have killed" || echo "killed") $KILLS, skipped $SKIPS, failed $FAILURES, over ${span}s"
+  info "events: $EVENTS"
+
+  [ "$REPORT" = none ] || write_report "$EVENTS" "$end_iso" "$span"
 
   if [ "$HOLD" -gt 0 ]; then
     info "holding the container open for ${HOLD}s so the report can be copied out"
@@ -1858,7 +1879,134 @@ run_loop() {
   done
 }
 
+# --replot <dir> rebuilds the charts and the report from a previous run's own
+# events.csv, config.env and plan.txt, without touching a cluster — the same
+# job storage-bench.sh's --replot does, and for the same reason: it is how a
+# change to write_report()/the *_svg functions gets tried against a real run
+# rather than a fresh one, and how a run whose report was never rendered
+# (REPORT=none, or cmark-gfm missing at the time) gets one after the fact.
+#
+# events.csv is the only file this strictly needs; config.env and plan.txt
+# fill in the rest — the tunables and the namespaces — best-effort, falling
+# back to today's environment or "(unknown)" rather than failing outright,
+# since none of it changes what gets drawn.
+REPLOT_END_ISO=""
+REPLOT_SPAN=0
+init_replot() { # <dir>
+  OUTDIR="${1%/}"
+  [ -n "$OUTDIR" ] && [ -d "$OUTDIR" ] || {
+    echo "Usage: $0 --replot <results-dir>" >&2
+    exit 1
+  }
+
+  EVENTS="$OUTDIR/events.csv"
+  [ -s "$EVENTS" ] || {
+    echo "$EVENTS not found — $OUTDIR does not look like a storage-chaos results directory" >&2
+    exit 1
+  }
+
+  # The run's own tunables, from the file its own header already invites
+  # re-running with (see write_plan). An explicitly-set environment variable
+  # here still wins, so REPORT=html ./storage-chaos.sh --replot <dir> can ask
+  # for html out of a run that used REPORT=md, the same override rule
+  # init_config gives a live run.
+  #
+  # CONFIG_SET is what config_lines()'s "set"/"default" column reads, and
+  # init_config is the only other place that declares it — skipped entirely
+  # here, so this declares it too, or config_lines dies on the first
+  # subscript into an array that was never declared at all. "set" for a
+  # replot means set for *this* invocation; config.env does not carry the
+  # original run's own set/default distinction, only its values.
+  local v
+  declare -gA CONFIG_SET=()
+  declare -A _explicit=()
+  for v in "${TUNABLES[@]}"; do
+    [ -n "${!v+x}" ] && { _explicit["$v"]="${!v}"; CONFIG_SET["$v"]=1; }
+  done
+  if [ -f "$OUTDIR/config.env" ]; then
+    set -a
+    # shellcheck disable=SC1090,SC1091
+    . "$OUTDIR/config.env"
+    set +a
+  fi
+  for v in "${!_explicit[@]}"; do declare -g "$v=${_explicit[$v]}"; done
+
+  case "$REPORT" in
+  html | md | none) ;;
+  *) REPORT=html ;;
+  esac
+  read -r -a KUBECTL <<<"${KUBECTL:-kubectl}"
+
+  # NAMESPACES is a positional argument, not a tunable, so config.env does not
+  # carry it — recovered from plan.txt's own header line instead.
+  PLANFILE="$OUTDIR/plan.txt"
+  NAMESPACES=()
+  if [ -f "$PLANFILE" ]; then
+    local ns_line
+    ns_line="$(awk -F': ' '/^namespaces:/ { print $2; exit }' "$PLANFILE")"
+    read -r -a NAMESPACES <<<"$ns_line"
+  fi
+  [ ${#NAMESPACES[@]} -eq 0 ] && NAMESPACES=("(unknown)")
+
+  init_output
+  init_traps
+
+  # START_ISO/START_NS, KILLS/SKIPS/FAILURES/ROUND and the run's end and span
+  # were tracked as the live run went; replotting recovers them from
+  # events.csv instead. The start is inverted out of the first row's own
+  # elapsed_s with the same arithmetic elapsed() used to write it — exact,
+  # not approximate, since epoch_ns and elapsed_s were both written from the
+  # same clock read. The counts are recounted by event type, the same way the
+  # per-kill and per-component tables in report_md already read them back.
+  local r2 ns2 el2 el2_ns last rest
+  r2="$(awk -F, 'NR==2 { print $2 "," $3; exit }' "$EVENTS")"
+  ns2="${r2%%,*}" el2="${r2#*,}"
+  if [ -n "$ns2" ] && [ -n "$el2" ]; then
+    # 10# forces base 10: elapsed()'s %03d zero-pads the millisecond part, and
+    # bash reads an unprefixed leading-zero literal as octal — "017" would
+    # silently become 15, and "008" isn't valid octal at all and aborts the
+    # script outright.
+    el2_ns=$((10#${el2%.*} * 1000000000 + 10#${el2#*.} * 1000000))
+    START_NS=$((ns2 - el2_ns))
+    printf -v START_ISO '%(%Y-%m-%dT%H:%M:%S)T.%06dZ' \
+      "$((START_NS / 1000000000))" "$(((START_NS % 1000000000) / 1000))"
+  else
+    START_ISO="unknown"
+    START_NS=0
+  fi
+
+  last="$(awk -F, 'END { print $1 "," $3 "," $4 }' "$EVENTS")"
+  REPLOT_END_ISO="${last%%,*}"
+  rest="${last#*,}"
+  REPLOT_SPAN="${rest%%,*}"
+  ROUND="${rest##*,}"
+  [ -n "$REPLOT_END_ISO" ] || REPLOT_END_ISO="unknown"
+  # Whole seconds, truncated same as finish()'s own integer division — the
+  # last row's elapsed_s carries milliseconds, and a replotted report
+  # otherwise reads "618.396s" beside a live one's "618s" for what is the
+  # same measurement.
+  REPLOT_SPAN="${REPLOT_SPAN%.*}"
+  [ -n "$REPLOT_SPAN" ] || REPLOT_SPAN=0
+  [ -n "$ROUND" ] || ROUND=0
+
+  KILLS="$(awk -F, '$5 == "kill-done"' "$EVENTS" | wc -l)"
+  FAILURES="$(awk -F, '$5 == "kill-failed"' "$EVENTS" | wc -l)"
+  SKIPS="$(awk -F, '$5 == "skip"' "$EVENTS" | wc -l)"
+
+  info "replotting: $OUTDIR"
+}
+
 main() {
+  if [ "${1:-}" = "--replot" ]; then
+    init_replot "${2:-}"
+    if [ "$REPORT" = none ]; then
+      info "REPORT=none — nothing to draw"
+    else
+      write_report "$EVENTS" "$REPLOT_END_ISO" "$REPLOT_SPAN"
+    fi
+    return 0
+  fi
+
   init_config "$@"
   mark_start
   init_output

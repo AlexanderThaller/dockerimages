@@ -101,6 +101,10 @@ Every tunable and its value is recorded in `chaos.log`, `plan.txt`,
 `config.env` and the report's Configuration section, each marked `set` (came
 from the environment) or `default` (the script chose it).
 
+`storage-chaos --replot <dir>` rebuilds the charts and report from a run's own
+`events.csv`, `config.env` and `plan.txt`, without a cluster — useful for
+rendering a report a first run skipped (`REPORT=none`, or no `cmark-gfm`).
+
 Start both containers at about the same time and correlate on the clock:
 everything is UTC, and `elapsed_s` is seconds since the chaos run started — the
 same axis a benchmark alongside it can be read on.
