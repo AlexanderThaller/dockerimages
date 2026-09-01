@@ -1524,8 +1524,14 @@ function nice_step(range, want,   raw, mag, r) {
   r = raw / mag
   return (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 5 ? 5 : 10))) * mag
 }
-# Decimals appropriate to a step: 0.1 wants one, 5 wants none.
-function fmt(v, step) {
+# Decimals appropriate to a step: 0.1 wants one, 5 wants none. Past 1000 this
+# hands off to the same SI-suffix formatter the log axis already uses (si(),
+# defined below) — a fast backend's IOPS axis is otherwise six bare digits
+# per tick, which is exactly the illegible-raw-number problem nice_step/hms
+# already fixed for elapsed time.
+function fmt(v, step,   a) {
+  a = (v < 0 ? -v : v)
+  if (a >= 1000) return si(v)
   return (step >= 1 ? sprintf("%d", v + 0.0001) :
          (step >= 0.1 ? sprintf("%.1f", v) : sprintf("%.2f", v)))
 }
@@ -1747,7 +1753,13 @@ END {
   print "  tip.setAttribute('transform','translate('+tx+','+ty+')');tip.style.display='block';"
   print "});"
   print "hit.addEventListener('mouseleave',function(){xh.style.display='none';tip.style.display='none';});"
-  print "function fmtv(v){var a=Math.abs(v);if(a>=1000)return v.toFixed(0);if(a>=10)return v.toFixed(1);return v.toFixed(2);}"
+  # Exact, unlike the axis — same split as the time hover: the axis rounds
+  # for readability (nice_step/hms, si() past 1000), the hover is what you
+  # asked for by pointing at it. Thousands get a separator rather than an SI
+  # suffix so it stays exact instead of rounding to '1.9M'.
+  print "function fmtv(v){var a=Math.abs(v);var s=a>=1000?v.toFixed(0):(a>=10?v.toFixed(1):v.toFixed(2));"
+  print "  var neg=s.charAt(0)==='-';if(neg)s=s.slice(1);var p=s.split('.');"
+  print "  p[0]=p[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');return (neg?'-':'')+p.join('.');}"
   # The axis ticks round to whole minutes past 90s, same as storage-chaos.sh's
   # hms() — but a hover is a request for precision the rounded axis gave up,
   # same as chaos's own tooltips (\"killed at +45s\", never \"+1m\"), so this
