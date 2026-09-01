@@ -399,6 +399,8 @@ chaos-osd-7-6f9c: ready after 42s
 | `READY_TAIL` | `45` | Extra seconds for the occasional slow one |
 | `READY_TAIL_PCT` | `12` | Percent of restarts that get the tail |
 | `READY_STAGGER` | `5` | Seconds added per workload, in creation order |
+| `TERM_AFTER` | `0` | Seconds before a killed pod exits on a graceful kill |
+| `TERM_SPREAD` | `0` | Uniform seconds drawn on top of it, per kill |
 | `IMAGE` | `ubi9/ubi-minimal` | Anything with a shell and `sleep` |
 | `RUN_AS_USER` | from the namespace | The uid the pods run as; see below |
 
@@ -426,6 +428,17 @@ back to `date +%s` — so the pods need no tool the image may not have. On an
 image whose `date` has no `%N` (busybox prints a literal `%N`) the fallback is
 per-second rather than per-pod, so two pods restarting inside the same second
 draw the same delay. The default image has `%N`.
+
+`TERM_AFTER`/`TERM_SPREAD` are the same idea applied to shutdown rather than
+startup, and matter only for a graceful kill (`KILL_MODE=graceful`) or a plain
+delete (`down`, a rollout) — a `force` kill (the default) goes through the API
+directly and is unaffected. Each pod's own command traps `SIGTERM` and exits
+after that delay on its own; without it, every container is PID 1 and ignores
+any signal it has not explicitly trapped, so the kubelet would wait out the
+full `terminationGracePeriodSeconds` — computed as
+`TERM_AFTER + TERM_SPREAD + 2s` of slack, and always at least 2s even at the
+`0`/`0` default — before giving up and sending `SIGKILL`. Left at the default
+`0`/`0`, a graceful kill or `down` exits about as fast as a `force` one.
 
 `RUN_AS_USER` is worked out from the namespace's
 `openshift.io/sa.scc.uid-range` annotation and only needs setting to override
