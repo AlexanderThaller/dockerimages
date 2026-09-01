@@ -380,6 +380,15 @@ every recovery on the timeline should come out a little over that number. If
 they do, the same run against `openshift-storage` is measuring what it says it
 is.
 
+Each pod logs its own delay before sleeping, so `kubectl logs` on a restarted
+one says what to expect rather than making you wait and compare against the
+report afterwards:
+
+```
+chaos-osd-7-6f9c: recovering in 42s (base=5s spread=10s tail=0)
+chaos-osd-7-6f9c: ready after 42s
+```
+
 | Variable | Default | |
 |---|---|---|
 | `OSDS` | `3` | Single-replica Deployments to create |

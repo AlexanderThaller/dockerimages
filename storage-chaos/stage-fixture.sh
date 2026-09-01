@@ -226,11 +226,18 @@ containers:
         # occasionally does not, and a symmetric spread hides exactly the case
         # a chaos run is looking for. A different slice of the same number
         # decides, so the two draws do not move together.
+        tail=0
         if [ \$(( (n / 100000) % 100 )) -lt $READY_TAIL_PCT ]; then
           d=\$(( d + $READY_TAIL ))
+          tail=1
         fi
+        # Printed before the sleep, not after, so a log tail shows the target
+        # the moment the container starts rather than only confirming it in
+        # hindsight once the probe has already caught it.
+        echo "\$HOSTNAME: recovering in \${d}s (base=${base}s spread=${READY_SPREAD}s tail=\$tail)"
         sleep \$d
         touch /tmp/ready
+        echo "\$HOSTNAME: ready after \${d}s"
         exec sleep infinity
     readinessProbe:
       exec:
