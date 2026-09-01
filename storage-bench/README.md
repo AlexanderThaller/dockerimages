@@ -137,8 +137,15 @@ the uid has no `/etc/passwd` entry and one cannot be added.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PLOT` | `1` | `0` skips the gnuplot graphs. The report says so, and the raw time-series logs are still written. |
+| `PLOT` | `1` | `0` skips the graphs. The report says so, and the raw time-series logs are still written. |
 | `RENDER` | `html` | `none` writes only the Markdown. The HTML is a single self-contained file with the graphs inlined. |
+
+Graphs are drawn by awk (`graphs/render-chart.awk`) rather than gnuplot — every
+chart is real SVG with a hover tooltip baked in, so the same file that renders
+in a browser lets you read values off it. `./storage-bench.sh --replot <results-dir>`
+redraws the graphs and rebuilds the report from a previous run's own logs and
+CSVs, without touching fio or pgbench again — the way to try a change to the
+drawing or reporting code against a real run.
 
 ## Justfile targets
 

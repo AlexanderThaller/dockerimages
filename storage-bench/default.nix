@@ -1,5 +1,6 @@
 # storage-bench — a container image that runs ./storage-bench.sh, with fio,
-# gnuplot, postgresql, cmark-gfm and bash.
+# postgresql, cmark-gfm and bash. The graphs are drawn by awk itself, so
+# there is no gnuplot or other rasteriser in here.
 #
 #   nix-build                       # -> ./result, a docker image tarball
 #   docker load < result            # or: podman load < result
@@ -102,7 +103,7 @@ pkgs.dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.title" = "storage-bench";
       "org.opencontainers.image.description" =
-        "fio/pgbench storage benchmark suite with gnuplot graphs and Markdown/HTML reporting";
+        "fio/pgbench storage benchmark suite with interactive awk-drawn graphs and Markdown/HTML reporting";
     };
   };
 }

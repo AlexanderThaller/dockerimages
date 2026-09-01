@@ -47,10 +47,20 @@
 #   READY_TAIL   extra seconds for the slow ones     (default 45)
 #   READY_TAIL_PCT  percent that get the tail        (default 12)
 #   READY_STAGGER   seconds added per workload       (default 5)
+#   TERM_AFTER   seconds before a killed pod exits   (default 0)
+#   TERM_SPREAD  uniform seconds on top of it        (default 0)
 #   IMAGE        image the pods run                (default ubi9/ubi-minimal)
 #   CPU / MEMORY resource requests per pod         (default 10m / 32Mi)
 #   RUN_AS_USER  uid the pods run as               (default: let the SCC pick)
 #   KUBECTL      client to use, may carry flags    (default kubectl)
+#
+# TERM_AFTER/TERM_SPREAD govern a *graceful* kill (KILL_MODE=graceful) and
+# plain deletes (`down`, a rollout): the pod's own command traps SIGTERM and
+# exits on its own after that delay, rather than the default of every
+# container ignoring SIGTERM as PID 1 and forcing the kubelet to wait out the
+# full terminationGracePeriodSeconds — 30s by default — before it gives up and
+# sends SIGKILL. force kills (the default KILL_MODE) go through the API
+# directly and never touch this at all.
 #
 # The default image is Red Hat's ubi-minimal because it is what an OpenShift
 # cluster can already pull — no Docker Hub rate limit, no pull secret — and
@@ -121,6 +131,13 @@ READY_TAIL_PCT="${READY_TAIL_PCT:-12}"
 # per-component histogram facets worth looking at. 0 gives every workload the
 # same base.
 READY_STAGGER="${READY_STAGGER:-5}"
+
+  # How long a graceful kill takes to actually exit — see the header comment.
+  # 0/0 by default: instant, so `down` and a KILL_MODE=graceful run are not
+  # slowed down by this fixture unless asked for.
+  TERM_AFTER="${TERM_AFTER:-0}"
+  TERM_SPREAD="${TERM_SPREAD:-0}"
+
   IMAGE="${IMAGE:-registry.access.redhat.com/ubi9/ubi-minimal:latest}"
   CPU="${CPU:-10m}"
   MEMORY="${MEMORY:-32Mi}"
@@ -132,7 +149,8 @@ READY_STAGGER="${READY_STAGGER:-5}"
   read -r -a KUBECTL <<<"${KUBECTL:-kubectl}"
   kc() { "${KUBECTL[@]}" "$@"; }
 
-  for v in OSDS MONS READY_AFTER READY_SPREAD READY_TAIL READY_TAIL_PCT READY_STAGGER; do
+  for v in OSDS MONS READY_AFTER READY_SPREAD READY_TAIL READY_TAIL_PCT READY_STAGGER \
+    TERM_AFTER TERM_SPREAD; do
     case "${!v}" in
     '' | *[!0-9]*)
       echo "$v must be a non-negative integer (got '${!v}')" >&2
@@ -140,6 +158,12 @@ READY_STAGGER="${READY_STAGGER:-5}"
       ;;
     esac
   done
+
+  # terminationGracePeriodSeconds has to cover the worst case of the trap's
+  # own delay, or the kubelet's SIGKILL races the pod's graceful exit and
+  # always wins — which would make TERM_AFTER/TERM_SPREAD a lie. +2s of slack
+  # for the shell itself to notice the signal and run the trap.
+  TERM_GRACE=$((TERM_AFTER + TERM_SPREAD + 2))
 }
 
 # The uid the pods run as, which has to be a real number in the manifest rather
@@ -198,6 +222,7 @@ securityContext:
   runAsUser: $POD_UID
   seccompProfile:
     type: RuntimeDefault
+terminationGracePeriodSeconds: $TERM_GRACE
 containers:
   - name: sleeper
     image: $IMAGE
@@ -238,7 +263,33 @@ containers:
         sleep \$d
         touch /tmp/ready
         echo "\$HOSTNAME: ready after \${d}s"
-        exec sleep infinity
+        # PID 1 in a container ignores any signal it has not explicitly
+        # trapped — SIGTERM included — so execing into a bare sleep here
+        # would mean a graceful kill or a plain delete never actually exits
+        # on its own: the kubelet waits out the full
+        # terminationGracePeriodSeconds every single time and then sends
+        # SIGKILL. Trapping it, and staying as the shell rather than execing
+        # into sleep, means the pod exits on its own after
+        # TERM_AFTER/TERM_SPREAD instead.
+        #
+        # The wait has to be backgrounded: a trap only runs between commands,
+        # so a foreground sleep would still block it until that sleep itself
+        # returned, which is never.
+        term() {
+          tn=\$(date +%N 2>/dev/null)
+          case "\$tn" in '' | *[!0-9]*) tn= ;; esac
+          tn=\${tn#\${tn%%[!0]*}}
+          [ -n "\$tn" ] || tn=\$(date +%s)
+          td=\$(( $TERM_AFTER + tn % ($TERM_SPREAD + 1) ))
+          echo "\$HOSTNAME: terminating in \${td}s"
+          sleep "\$td"
+          exit 0
+        }
+        trap term TERM
+        while true; do
+          sleep 3600 &
+          wait \$!
+        done
     readinessProbe:
       exec:
         command: ["/bin/sh", "-c", "test -f /tmp/ready"]
@@ -346,6 +397,8 @@ run_action() {
     echo "and ${READY_TAIL_PCT}% of them take ${READY_TAIL}s longer still — so that is the spread the"
     echo "recovery histogram from this fixture should show. READY_SPREAD=0"
     echo "restores a single fixed delay."
+    echo "A graceful kill or delete exits between ${TERM_AFTER}s and $((TERM_AFTER + TERM_SPREAD))s later —"
+    echo "force kills (the default) go through the API directly and skip this entirely."
     echo
     echo "  ./storage-chaos.sh $NS"
     echo "  INCLUDE='/chaos-osd-' ./storage-chaos.sh $NS      # the OSD lookalikes alone"

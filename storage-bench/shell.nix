@@ -4,12 +4,10 @@
 #   nix-shell --run './storage-bench.sh /tank/backup'
 #   nix-shell                                          # then run it by hand
 #
-# Without this, a host that has fio but no gnuplot still finishes the whole
-# benchmark and then hands you a report with no graphs in it.
-#
-# The gnuplot here is the image's cut-down build, which draws SVG and has no
-# rasterising terminals at all. That is deliberate: a host shell that could
-# still produce PNGs would hide a difference the image cannot reproduce.
+# Without this, a host that has fio but no cmark-gfm still finishes the whole
+# benchmark and then hands you a report that stayed Markdown instead of HTML.
+# The graphs themselves need nothing beyond awk, which this shell — like the
+# image — always has.
 
 { pkgs ? import (import ./nixpkgs.nix) { } }:
 
