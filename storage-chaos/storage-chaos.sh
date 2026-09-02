@@ -1409,6 +1409,7 @@ report_md() { # <events.csv> <end iso> <span seconds>
 | Ended | \`$2\` |
 | Duration | ${3}s |
 | Namespaces | \`${NAMESPACES[*]}\` |
+| Label | ${LABEL:+\`$LABEL\`}$([ -z "$LABEL" ] && echo "n/a") |
 | Mode | \`$MODE\`$([ "$MODE" = random ] && echo ", seed \`$SEED\`") |
 | Kill mode | \`$KILL_MODE\`$([ "$KILL_MODE" = graceful ] && echo ", grace ${GRACE}s") |
 | Rounds run | $ROUND of $([ "$ITERATIONS" -eq 0 ] && echo "unlimited" || echo "$ITERATIONS"), $BATCH pod(s) each |

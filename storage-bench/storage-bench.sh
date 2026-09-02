@@ -1966,6 +1966,7 @@ log "Writing report"
 | Property | Value |
 | -------- | ----- |
 | Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC')$([ -n "$REPLOT_DIR" ] && echo " (--replot)") |
+| Label             | ${LABEL:-n/a} |
 | Total runtime     | ${ELAPSED_LABEL} |
 | Host / pod        | $(uname -n) |
 | Kernel            | $(uname -r) |
