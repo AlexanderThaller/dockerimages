@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-09-02-r0"
+tag := "2026-09-02-r1"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -47,6 +47,62 @@ build:
 # Build, then load the image into the local container engine.
 load: build
     {{ engine }} load < result
+
+# The pin lives in nixpkgs.nix and the branch it tracks is the comment on the
+# rev line, so neither recipe needs to be told anything: they read the branch
+# out of the file they are about to rewrite. Pass one to move to another
+# branch — `just update-nixpkgs nixos-26.11` rewrites that comment too, and
+# the no-argument form tracks the new branch from then on.
+
+# Show the pinned nixpkgs revision and whether its branch has moved on.
+check-nixpkgs branch="":
+    @just _nixpkgs check "{{ branch }}"
+
+# Move the nixpkgs pin to the head of the branch it tracks.
+update-nixpkgs branch="":
+    @just _nixpkgs update "{{ branch }}"
+
+# The body shared by `check-nixpkgs` and `update-nixpkgs`; the check is the
+# update stopped just before it writes anything.
+_nixpkgs action branch="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file=nixpkgs.nix
+    old_rev="$(sed -n 's/^ *rev = "\([0-9a-f]*\)".*/\1/p' "$file")"
+    old_branch="$(sed -n 's/^ *rev = .*# *\([^,]*\),.*/\1/p' "$file")"
+    branch="{{ branch }}"
+    [ -n "$branch" ] || branch="$old_branch"
+    [ -n "$branch" ] || { echo "cannot tell which branch $file tracks — pass one" >&2; exit 1; }
+    rev="$(git ls-remote https://github.com/NixOS/nixpkgs "refs/heads/$branch" | cut -f1)"
+    [ -n "$rev" ] || { echo "no such nixpkgs branch: $branch" >&2; exit 1; }
+    echo "pinned: $old_rev ($old_branch)"
+    echo "head:   $rev ($branch)"
+    if [ "$rev" = "$old_rev" ] && [ "$branch" = "$old_branch" ]; then
+        echo "already current"
+        exit 0
+    fi
+    if [ "{{ action }}" != update ]; then
+        # Naming the branch back only when it is not the pinned one, so the
+        # hint is copy-pasteable after `just check-nixpkgs nixos-26.11`.
+        [ "$branch" = "$old_branch" ] && hint="" || hint=" $branch"
+        echo "move it with: just update-nixpkgs$hint"
+        exit 0
+    fi
+    # The date in the comment is the commit's own rather than today's, so the
+    # pin says how old the tree is instead of when someone last ran this.
+    # Today is the fallback for an unreachable or rate-limited API.
+    commit_date="$(curl -fsSL "https://api.github.com/repos/NixOS/nixpkgs/commits/$rev" \
+                   | sed -n 's/.*"date": *"\([0-9-]\{10\}\)T.*/\1/p' | head -1)" || true
+    [ -n "$commit_date" ] || commit_date="$(date -u +%F)"
+    # --unpack because fetchTarball hashes the unpacked tree, not the tarball.
+    sha="$(nix-prefetch-url --unpack "https://github.com/NixOS/nixpkgs/archive/$rev.tar.gz")"
+    sed -i \
+        -e "s|refs/heads/[A-Za-z0-9._/-]*|refs/heads/$branch|" \
+        -e "s|^\( *rev = \).*|\1\"$rev\"; # $branch, $commit_date|" \
+        -e "s|^\( *sha256 = \).*|\1\"$sha\";|" \
+        "$file"
+    echo "$file now pins $branch at $rev ($commit_date)"
+    echo "rebuild with: just load"
 
 # Needs only a container engine — no Nix, no checkout of anything but this
 # Justfile — which is what makes it the one to run on the storage host itself:
