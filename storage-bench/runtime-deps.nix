@@ -2,9 +2,9 @@
 # (default.nix) and the host shell (shell.nix) so the two cannot drift apart.
 #
 # Drift is the reason this is its own file: a host run that is missing
-# cmark-gfm still completes the benchmark, it just silently produces a report
-# with no HTML rendering — the kind of difference you notice an hour after the
-# run.
+# cmark-gfm or typst still completes the benchmark, it just silently produces a
+# report that was never rendered — the kind of difference you notice an hour
+# after the run.
 #
 # fio is a trimmed variant rather than the stock package. Stock, it carries
 # optional features this benchmark never touches. The override below says
@@ -61,6 +61,30 @@ let
   # `-e table` is what makes the results CSVs render as tables; it is a GFM
   # extension rather than CommonMark, so plain `cmark` will not do.
   cmark-gfm = pkgs.cmark-gfm;
+
+  # Renders the same Markdown as storage-benchmark-report.pdf. This is the one
+  # dependency here whose size is not an afterthought: a single static Rust
+  # binary that takes the image from 133 MB to 178 MB. It is 45 MB rather than
+  # the 51 MB it costs storage-chaos because the openssl typst links — for a
+  # package registry this image never reaches — is already here behind
+  # postgresql. `just size` is what says whether that holds after a bump.
+  #
+  # It is here because everything else that produces a PDF is worse by a wide
+  # margin. Measured against this same pin, on top of the closure as it stood:
+  # pandoc is +233 MB and still needs an engine underneath it (+276 MB with
+  # typst as that engine — a Haskell runtime whose job is to reach typst),
+  # weasyprint is +260 MB of Python and would have doubled the image,
+  # wkhtmltopdf is +153 MB of unmaintained WebKit, and headless chromium is
+  # +1.7 GB. Only lowdown piped into `groff -Tpdf` beats it, at +12 MB — and
+  # roff has no way to place an SVG, which would cost the report all 135 of
+  # its charts.
+  #
+  # typst reads those charts itself, because resvg is built into it. That is
+  # what keeps this to one package: no rasteriser, no librsvg, and no second
+  # renderer that has to agree with render-chart.awk about what a chart looks
+  # like. The crosshair script baked into each SVG is ignored, which is the
+  # right answer for paper.
+  typst = pkgs.typst;
 
   # The non-synthetic half of the benchmark. pgbench ships inside the main
   # postgresql output, so this one package covers initdb, the server and the
@@ -120,6 +144,7 @@ in
   packages = [
     fio
     cmark-gfm
+    typst
     postgresql
   ] ++ (with pkgs; [
     bashInteractive

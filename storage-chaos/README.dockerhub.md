@@ -10,8 +10,9 @@ OpenShift ODF versus Portworx trial: one container measuring a PVC on each
 provider, one container taking the storage pods out from under them.
 
 The image is a Nix closure and nothing else — `kubectl`, `bash`, `gawk`,
-`coreutils` and `cmark-gfm`, no distro userland and no package manager. It runs
-unprivileged, under an arbitrary uid, and needs no node access.
+`coreutils`, `cmark-gfm` and `typst`, no distro userland and no package
+manager. It runs unprivileged, under an arbitrary uid, and needs no node
+access.
 
 ## Quick start
 
@@ -94,7 +95,9 @@ chaos-<timestamp>/
 ├── recovery.svg   time to recover per kill, against when it happened
 ├── histogram.svg  distribution of recovery times, overall and per component
 ├── timeline.svg   one lane per component, kills and recoveries along time
-└── report.html    all of the above, rendered — this is the one to read
+├── report.html    all of the above, rendered — this is the one to read
+├── report.pdf     the same document paginated, for sending on
+└── report.typ     the typst source the PDF was compiled from
 ```
 
 Every tunable and its value is recorded in `chaos.log`, `plan.txt`,
@@ -103,7 +106,8 @@ from the environment) or `default` (the script chose it).
 
 `storage-chaos --replot <dir>` rebuilds the charts and report from a run's own
 `events.csv`, `config.env` and `plan.txt`, without a cluster — useful for
-rendering a report a first run skipped (`REPORT=none`, or no `cmark-gfm`).
+rendering a report a first run skipped (`REPORT=none`, or no `cmark-gfm`
+or `typst`).
 
 Start both containers at about the same time and correlate on the clock:
 everything is UTC, and `elapsed_s` is seconds since the chaos run started — the

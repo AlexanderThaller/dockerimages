@@ -17,7 +17,7 @@
 # container, so `MODE=deterministic INTERVAL=120 just chaos portworx` works.
 
 image := "storage-chaos"
-tag := "2026-09-02-r1"
+tag := "2026-09-04-r0"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.

@@ -11,8 +11,9 @@ writes included — which is always less, and is the number an application would
 recognise.
 
 No distro userland, no package manager: the image is a Nix closure of fio,
-postgresql, cmark-gfm and bash — 41 MB compressed, 133 MB on disk. The graphs
-are drawn by awk itself, so there is no gnuplot or other rasteriser in here.
+postgresql, cmark-gfm, typst and bash — 62 MB compressed, 178 MB on disk. The
+graphs are drawn by awk itself, so there is no gnuplot or other rasteriser in
+here; typst reads those SVGs directly to put them in the PDF.
 
 ## Run it
 
@@ -130,7 +131,7 @@ working set would report the speed of RAM. `fsync`, `synchronous_commit` and
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PLOT` | `1` | `0` skips the graphs. |
-| `RENDER` | `html` | `none` writes only the Markdown. |
+| `RENDER` | `html` | Renders both HTML and PDF; `none` writes only the Markdown. |
 
 ## What you get
 
@@ -138,7 +139,9 @@ working set would report the speed of RAM. `fsync`, `synchronous_commit` and
 bench-results-<timestamp>.tar.gz     everything below, in one file
 bench-results-<timestamp>/
 ├── storage-benchmark-report.html    self-contained, graphs inlined
-├── storage-benchmark-report.md      the same, readable as text
+├── storage-benchmark-report.pdf     the same, paginated, for sending on
+├── storage-benchmark-report.md      the same again, readable as text
+├── storage-benchmark-report.typ     the typst source behind the PDF
 ├── fio_results.csv
 ├── pgbench_results.csv
 ├── graphs/{run-NN,aggregate,compare}/

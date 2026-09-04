@@ -204,7 +204,7 @@ the replacement start before the old container is necessarily gone.
 | `OUTBASE` | `/tmp` | Directory the run directory goes in |
 | `LABEL` | none | Appended to the default `RUNDIR`, so a run stays sortable by timestamp and still readable (`LABEL=osd-kills` → `chaos-<timestamp>-osd-kills`). Only shapes the default — ignored once `RUNDIR` is set explicitly. |
 | `RUNDIR` | `chaos-<timestamp>` | This run's directory inside it; empty writes straight into `OUTBASE` |
-| `REPORT` | `html` | `html`, `md` or `none` |
+| `REPORT` | `html` | `html` (HTML *and* PDF), `md` or `none` |
 | `HOLD` | `0` | Seconds to stay alive after the report is written |
 | `KUBECTL` | `kubectl` | Client to use; may carry flags, e.g. `oc --context lab` |
 
@@ -224,16 +224,18 @@ chaos-<timestamp>/
 ├── recovery.svg   time to recover per kill, against when it happened
 ├── histogram.svg  distribution of recovery times, overall and per component
 ├── timeline.svg   one lane per component, kills and recoveries along time
-└── report.html    all of the above, rendered — this is the one to read
+├── report.html    all of the above, rendered — this is the one to read
+├── report.pdf     the same document paginated, for sending on
+└── report.typ     the typst source the PDF was compiled from
 ```
 
 `./storage-chaos.sh --replot <dir>` rebuilds the charts and the report from a
 run's own `events.csv`, `config.env` and `plan.txt`, without touching a
 cluster — for trying a change to the charts or the report against a real run,
 or for rendering the report a first run skipped (`REPORT=none`, or `cmark-gfm`
-missing at the time). An environment variable set alongside `--replot` still
-wins over the run's own `config.env`, e.g. `REPORT=html ./storage-chaos.sh
---replot <dir>` out of a run that used `REPORT=md`.
+or `typst` missing at the time). An environment variable set alongside
+`--replot` still wins over the run's own `config.env`, e.g. `REPORT=html
+./storage-chaos.sh --replot <dir>` out of a run that used `REPORT=md`.
 
 ### The four charts
 

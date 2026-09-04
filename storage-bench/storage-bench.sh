@@ -70,7 +70,7 @@
 #   PGBENCH_MODE  simple | extended | prepared  (default prepared)
 #   PGBENCH_MAX_WAL  postgres max_wal_size      (default 4GB)
 #   PLOT          1|0, draw the graphs          (default 1)
-#   RENDER        html|none                     (default html)
+#   RENDER        html|none, HTML and PDF       (default html)
 #   ARCHIVE       1|0, tar.gz the run directory  (default 1)
 #
 # fio measures the storage directly. pgbench measures what a real application
@@ -239,10 +239,16 @@ esac
   exit 1
 }
 
-# HTML only. Anything else — PDF, DOCX — means pandoc, and pandoc is a Haskell
-# binary several times the size of everything else in this image put together,
-# for output formats nobody was reading. The Markdown is kept next to the HTML,
-# so pandoc on any host that has it still gets you one.
+# html renders both the HTML and the PDF; there is no knob to ask for one and
+# not the other, because they are two views of the same Markdown and the run
+# has already paid for everything either of them needs.
+#
+# PDF used to mean pandoc, and pandoc is a Haskell binary several times the
+# size of everything else in this image put together. It is typst instead:
+# +51 MB against pandoc's +233 MB, which still needs an engine underneath it.
+# See runtime-deps.nix for what else was measured. Anything past these two —
+# DOCX, EPUB — is still pandoc's, and still not worth it; the Markdown is kept
+# next to both, so pandoc on any host that has it can have the rest.
 case "$RENDER" in
 html | none) ;;
 *)
@@ -449,10 +455,17 @@ MISSING=()
 have_plot=0
 [ "$PLOT" = "1" ] && have_plot=1
 
-if [ "$RENDER" != "none" ] && ! command -v cmark-gfm >/dev/null 2>&1; then
-  echo "NOTE cmark-gfm not found in PATH — report stays as Markdown source" >&2
-  MISSING+=("cmark-gfm — the report was not rendered")
-  RENDER=none
+# The two renderers are checked separately and degrade separately: they read
+# the same Markdown but share nothing else, and a host with typst but no
+# cmark-gfm should still come away with a PDF rather than with neither.
+have_html=0
+if [ "$RENDER" != "none" ]; then
+  if command -v cmark-gfm >/dev/null 2>&1; then
+    have_html=1
+  else
+    echo "NOTE cmark-gfm not found in PATH — no HTML, the Markdown stays as source" >&2
+    MISSING+=("cmark-gfm — the report was not rendered as HTML")
+  fi
 fi
 
 # PostgreSQL resolves the uid it is running as through getpwuid() and treats a
@@ -2297,6 +2310,18 @@ This is also how a change to \`storage-bench.sh\`'s drawing or reporting code is
 tried out against a real run: point \`--replot\` at any \`bench-results-*\`
 directory, including one from an older version of the script, and only the
 graphs and report are touched.
+
+\`storage-benchmark-report.typ\` is the typst source this report's PDF was
+compiled from — preamble, then the Markdown above converted under it. It needs
+nothing but typst, and it is what rebuilds the PDF on a machine that has one
+when the machine that ran the benchmark did not:
+
+\`\`\`console
+\$ typst compile --root . storage-benchmark-report.typ
+\`\`\`
+
+Editing it is also the way to change how a page is laid out — margins, the
+point at which a wide table is turned sideways — without rerunning anything.
 MDEOF
 } >"$MD"
 
@@ -2523,6 +2548,316 @@ decorate() { # <base dir the markdown's graphs/... image paths are relative to>
   '
 }
 
+# Markdown -> typst, for the Markdown this script writes and no other. The
+# input is a known subset — headings, pipe tables, fenced code, image-only
+# paragraphs, bullets, and inline `code`, **strong**, _emphasis_ and
+# intra-document links — so this is a converter, not a parser, and it is
+# allowed to be wrong about anything the report block never emits.
+#
+# The .md stays the one source the PDF and the HTML are both made from, which
+# is what keeps --replot able to rebuild either of them from an old run, and
+# what keeps the section numbers and the contents page saying the same thing
+# in both.
+#
+# The file is read twice: the first pass collects the heading anchors, because
+# a link can point at a section further down and typst refuses to compile a
+# reference to a label that does not exist yet.
+md_to_typst() { # <markdown>
+  awk '
+    # The same slugs decorate() computes for the HTML — lowercased,
+    # punctuation dropped, spaces hyphenated, duplicates suffixed — so the
+    # `](#fio-tests)` links in the Markdown resolve in the PDF, in the HTML
+    # and on a forge, off the one document.
+    function slugify(s,   t) {
+      t = tolower(s)
+      gsub(/`/, "", t)
+      gsub(/\*\*/, "", t)
+      gsub(/[^a-z0-9 _-]/, "-", t)
+      gsub(/ +/, "-", t)
+      gsub(/-+/, "-", t)
+      sub(/^-/, "", t)
+      sub(/-$/, "", t)
+      return t
+    }
+
+    function anchor(s,   base) {
+      base = slugify(s)
+      if (base == "") base = "section"
+      if (base in seen) { base = base "-" seen[base]; seen[base]++ }
+      else seen[base] = 1
+      return base
+    }
+
+    # Every character typst reads as markup, escaped one at a time rather than
+    # with a chain of gsubs: the replacement string in gsub eats backslashes of
+    # its own, and getting that wrong is silent — it does not fail, it drops
+    # the character.
+    #
+    # The second dash of a `--` and the second dot of a `...` go too. Typst
+    # folds those into an en dash and an ellipsis, which is right for prose
+    # and wrong for every fio flag this report names outside a code span; the
+    # prose here already uses the em dashes it means.
+    function esc(s,   i, c, prev, out) {
+      out = ""
+      prev = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (index("\\#$@<>*_~`[]", c) || (c == prev && (c == "-" || c == ".")))
+          out = out "\\" c
+        else out = out c
+        prev = c
+      }
+      return out
+    }
+
+    # A typst string literal, for the arguments that are not markup: raw block
+    # bodies, image paths, link targets.
+    function str(s,   i, c, out) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else out = out c
+      }
+      return "\"" out "\""
+    }
+
+    # Inline markup. match() on the alternation finds the leftmost token; what
+    # precedes it is escaped, the token is translated, and the rest goes round
+    # again. RSTART and RLENGTH are read out before anything recurses, because
+    # they are global and the recursive call overwrites them.
+    function inl(s,   out, tok, body, alt, src, txt, url, a) {
+      out = ""
+      while (length(s) > 0) {
+        if (!match(s, /`[^`]*`|\*\*[^*]+\*\*|!\[[^]]*\]\([^)]*\)|\[[^]]*\]\([^)]*\)|_[^_]+_/)) {
+          out = out esc(s)
+          break
+        }
+        out = out esc(substr(s, 1, RSTART - 1))
+        tok = substr(s, RSTART, RLENGTH)
+        s = substr(s, RSTART + RLENGTH)
+
+        if (substr(tok, 1, 1) == "`") {
+          # Raw is literal in typst and uses the same delimiter, so a code span
+          # travels as it stands.
+          out = out tok
+        } else if (substr(tok, 1, 2) == "**") {
+          out = out "*" esc(substr(tok, 3, length(tok) - 4)) "*"
+        } else if (substr(tok, 1, 2) == "![") {
+          body = substr(tok, 3)
+          alt = substr(body, 1, index(body, "](") - 1)
+          src = substr(body, index(body, "](") + 2)
+          sub(/\)$/, "", src)
+          out = out "#box(image(" str(src) "))"
+        } else if (substr(tok, 1, 1) == "[") {
+          body = substr(tok, 2)
+          txt = substr(body, 1, index(body, "](") - 1)
+          url = substr(body, index(body, "](") + 2)
+          sub(/\)$/, "", url)
+          if (substr(url, 1, 1) == "#") {
+            a = substr(url, 2)
+            # A link to a section this document does not have is left as plain
+            # text: typst treats a dangling label as a hard error, and losing
+            # the link is a better outcome than losing the report.
+            out = out (a in target ? "#link(<sec-" a ">)[" inl(txt) "]" : inl(txt))
+          } else {
+            out = out "#link(" str(url) ")[" inl(txt) "]"
+          }
+        } else {
+          out = out "_" esc(substr(tok, 2, length(tok) - 2)) "_"
+        }
+      }
+      return out
+    }
+
+    function flushpara() {
+      if (para != "") print inl(para) "\n"
+      para = ""
+    }
+
+    # One pipe table row, with the empties the leading and trailing bars leave
+    # behind dropped.
+    function cells(line, arr,   i, n, tmp) {
+      sub(/^\|/, "", line)
+      sub(/\|[ \t]*$/, "", line)
+      n = split(line, tmp, /\|/)
+      for (i = 1; i <= n; i++) {
+        arr[i] = tmp[i]
+        sub(/^[ \t]+/, "", arr[i])
+        sub(/[ \t]+$/, "", arr[i])
+      }
+      return n
+    }
+
+    # Row two of a GFM table is the alignment row, and it is the only place
+    # that says which columns are numbers: `---:` is how csv_table() marks a
+    # column meant to be read down rather than across.
+    function flushtable(   i, j, n, c, a, al, out) {
+      if (trows == 0) return
+      n = cells(trow[1], c)
+      al = ""
+      if (trows >= 2) {
+        split("", a)
+        cells(trow[2], a)
+        for (i = 1; i <= n; i++)
+          al = al (i > 1 ? ", " : "") (a[i] ~ /:$/ ? "right" : "left")
+      }
+      print "#tbl("
+      printf "  columns: %d,\n", n
+      if (al != "") printf "  align: (%s),\n", al
+      out = "  table.header("
+      for (i = 1; i <= n; i++) out = out (i > 1 ? ", " : "") "[" inl(c[i]) "]"
+      print out "),"
+      for (i = 3; i <= trows; i++) {
+        split("", c)
+        cells(trow[i], c)
+        out = "  "
+        for (j = 1; j <= n; j++) out = out (j > 1 ? ", " : "") "[" inl(c[j]) "]"
+        print out ","
+      }
+      print ")\n"
+      trows = 0
+    }
+
+    FNR == NR {
+      if ($0 ~ /^```/) { p1fence = !p1fence; next }
+      if (!p1fence && $0 ~ /^#{1,6} /) target[anchor(substr($0, index($0, " ") + 1))] = 1
+      next
+    }
+
+    FNR == 1 { split("", seen) }
+
+    # A fence body is handed to raw() as a string rather than rebuilt as a
+    # typst backtick block, so a fence that holds backticks of its own cannot
+    # end the block early.
+    fence {
+      if ($0 ~ /^```/) { print "#raw(block: true, " str(fbody) ")\n"; fence = 0; next }
+      fbody = fbody (fbody == "" ? "" : "\n") $0
+      next
+    }
+    /^```/ { flushpara(); flushtable(); fence = 1; fbody = ""; next }
+
+    /^\|/ { flushpara(); trow[++trows] = $0; next }
+    trows { flushtable() }
+
+    /^#{1,6} / {
+      flushpara()
+      lvl = index($0, " ") - 1
+      txt = substr($0, lvl + 2)
+      printf "%s %s <sec-%s>\n\n", substr("======", 1, lvl), inl(txt), anchor(txt)
+      next
+    }
+
+    # An image on its own line is a figure and its alt text is the caption —
+    # the same reading decorate() gives it for the HTML.
+    /^!\[[^]]*\]\([^)]*\)[ \t]*$/ {
+      flushpara()
+      body = substr($0, 3)
+      alt = substr(body, 1, index(body, "](") - 1)
+      src = substr(body, index(body, "](") + 2)
+      sub(/\)[ \t]*$/, "", src)
+      print "#figure(image(" str(src) ", width: 100%), caption: [" inl(alt) "])\n"
+      next
+    }
+
+    /^[*-] / { flushpara(); inlist = 1; print "- " inl(substr($0, 3)); next }
+
+    # A bullet continued on the next line is indented; a blank line ends the
+    # list.
+    inlist && /^[ \t]+[^ \t]/ { print "  " inl(substr($0, match($0, /[^ \t]/))); next }
+    inlist && /^[ \t]*$/ { inlist = 0; print ""; next }
+
+    /^[ \t]*$/ { flushpara(); next }
+
+    { para = para (para == "" ? "" : " ") $0 }
+
+    END { flushpara(); flushtable(); if (fence) print "#raw(block: true, " str(fbody) ")" }
+  ' "$1" "$1"
+}
+
+# The preamble, and then the .md converted under it. This is kept as a file in
+# the run directory rather than piped straight into typst, for the same reason
+# graphs/render-chart.awk is: it is what someone rebuilds the PDF from on a
+# machine that has typst when this one did not, and it is the first place to
+# look when a page comes out wrong — a layout complaint is about a line of
+# this, not about a line of the Markdown.
+render_typst() { # <markdown> <typst out>
+  {
+    cat <<'TYPEOF'
+#set page(paper: "a4", margin: (x: 1.6cm, y: 1.8cm), numbering: "1 / 1")
+#set text(size: 9.5pt)
+// The prose is written with the characters it means, and a pod name in a
+// table is not prose, so typst's quote curling stays off.
+#set smartquote(enabled: false)
+#set par(justify: false, leading: 0.62em, spacing: 1.1em)
+#show raw: set text(font: "DejaVu Sans Mono", size: 8pt)
+#show link: set text(fill: rgb("#1a6ec4"))
+#show figure: set block(breakable: false)
+#set figure(gap: 0.7em)
+#show figure.caption: set text(size: 8.5pt, fill: luma(90))
+
+// The h1 is the report's title and carries no number of its own, so the
+// numbering starts at the h2 and reads 1., 1.1.
+#set heading(numbering: (..n) => {
+  let p = n.pos()
+  if p.len() > 1 { numbering("1.1.", ..p.slice(1)) }
+})
+#show heading.where(level: 1): set text(size: 17pt)
+#show heading.where(level: 2): it => block(width: 100%, above: 1.6em, below: 0.9em)[
+  #it
+  #v(-0.5em)
+  #line(length: 100%, stroke: 0.5pt + luma(200))
+]
+
+// The HTML answers a table wider than the window with a horizontal scrollbar.
+// A page has no such thing, so a wide table is either scaled a little or —
+// once scaling would take it below reading size — turned sideways onto a page
+// of its own. The fio results table is eight columns wide and lands in the
+// second case.
+//
+// The widths are spelled out rather than measured because measuring the space
+// actually available means layout(), and page() is not allowed inside a
+// container.
+#let w-page = 21cm - 3.2cm
+#let w-flipped = 29.7cm - 3.2cm
+#let tbl(..args) = context {
+  let t = table(stroke: 0.4pt + luma(200), inset: (x: 5pt, y: 3.5pt), ..args)
+  let nat = measure(t).width
+  let fit(w) = {
+    let f = calc.min(1.0, w / nat)
+    if f >= 0.999 { t } else { block(width: w, scale(t, x: f * 100%, y: f * 100%, reflow: true)) }
+  }
+  if nat <= w-page / 0.85 { fit(w-page) } else { page(flipped: true, fit(w-flipped)) }
+}
+#show table.cell.where(y: 0): strong
+#set table(fill: (_, y) => if calc.odd(y) and y > 0 { luma(247) })
+
+// Level 1 is the title, so the contents page starts at the sections under it.
+#show outline.entry.where(level: 1): none
+#outline(title: [Contents], depth: 3)
+TYPEOF
+    echo
+    md_to_typst "$1"
+  } >"$2"
+}
+
+# typst reads the chart SVGs itself — resvg is built into it — so nothing here
+# rasterises anything and no second renderer has to agree with
+# render-chart.awk about what a chart looks like. The crosshair script baked
+# into each one is dropped, which is what a page wants: resvg ignores
+# <script>, and there is nothing to hover on paper.
+#
+# --ignore-system-fonts is what makes a host run and a container run produce
+# the same pages: the image has no fonts at all beyond the four typst carries,
+# and a laptop that quietly substituted its own would be the same drift
+# runtime-deps.nix exists to prevent. The four are enough — render-chart.awk
+# asks for `system-ui, sans-serif` and lands on the bundled serif, every axis
+# label intact.
+render_pdf() { # <typst source> <pdf out>
+  typst compile --ignore-system-fonts --root "$OUTDIR" "$1" "$2"
+}
+
 render_html() { # <markdown> <html out>
   local md="$1" out="$2" rc
 
@@ -2537,15 +2872,44 @@ render_html() { # <markdown> <html out>
 }
 
 HTML=""
+PDF=""
+TYP=""
 
 if [ "$RENDER" = "html" ]; then
   log "Rendering report"
-  info "HTML ..."
-  html_out="$OUTDIR/storage-benchmark-report.html"
-  if render_html "$MD" "$html_out" 2>"$RAWDIR/render.log" &&
-    [ -s "$html_out" ]; then
-    HTML="$html_out"
+
+  if [ "$have_html" = 1 ]; then
+    info "HTML ..."
+    html_out="$OUTDIR/storage-benchmark-report.html"
+    if render_html "$MD" "$html_out" 2>"$RAWDIR/render.log" &&
+      [ -s "$html_out" ]; then
+      HTML="$html_out"
+    else
+      info "  FAILED (see $RAWDIR/render.log)"
+    fi
+  fi
+
+  # The typst source is written whether or not there is a typst to compile it,
+  # the same way the Markdown is written whether or not there is a cmark-gfm:
+  # converting costs one pass of awk, and a benchmark that ran for an hour and
+  # then found no binary should still hand back everything that binary would
+  # have been given.
+  TYP="$OUTDIR/storage-benchmark-report.typ"
+  render_typst "$MD" "$TYP"
+
+  # A typst that is missing, or that chokes on something md_to_typst() got
+  # wrong, costs the PDF and nothing else — the HTML above has already been
+  # written, and an hour of fio is not worth losing to a converter bug. The
+  # .typ stays behind either way; on a failure it is the evidence.
+  info "PDF ..."
+  pdf_out="$OUTDIR/storage-benchmark-report.pdf"
+  if ! command -v typst >/dev/null 2>&1; then
+    info "  typst not found in PATH — skipping (the .typ is still written)"
+    MISSING+=("typst — the report was not rendered as PDF")
+  elif render_pdf "$TYP" "$pdf_out" 2>>"$RAWDIR/render.log" && [ -s "$pdf_out" ]; then
+    PDF="$pdf_out"
   else
+    rm -f "$pdf_out"
     info "  FAILED (see $RAWDIR/render.log)"
   fi
 fi
@@ -2608,6 +2972,8 @@ fi
 [ -n "$ARCHIVE_PATH" ] && echo "  Archive  : $ARCHIVE_PATH"
 echo "  Report   : $MD"
 [ -n "$HTML" ] && echo "             $HTML"
+[ -n "$PDF" ] && echo "             $PDF"
+[ -n "$TYP" ] && echo "             $TYP"
 echo "  CSVs     : $FIO_CSV"
 [ "$have_pgbench" = 1 ] && echo "             $PG_CSV"
 if [ "$have_plot" = 1 ]; then
@@ -2629,10 +2995,11 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   echo "  Set PLOT=0 / RENDER=none to make the omission deliberate and silent."
 fi
 
-if [ -z "$HTML" ]; then
+if [ -z "$HTML" ] || [ -z "$PDF" ]; then
   echo
-  echo "The Markdown is readable as it stands. To render it elsewhere, from $OUTDIR"
-  echo "so that the relative graphs/ paths resolve:"
+  echo "The Markdown is readable as it stands, and the typst source next to it needs"
+  echo "nothing but typst. From $OUTDIR, so that the relative"
+  echo "graphs/ paths resolve:"
   echo "  pandoc -s --toc --embed-resources -o report.html storage-benchmark-report.md"
-  echo "  pandoc -o report.pdf storage-benchmark-report.md   # -> PDF, needs a TeX engine"
+  echo "  typst compile --root . storage-benchmark-report.typ"
 fi

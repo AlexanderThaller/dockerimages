@@ -2,9 +2,9 @@
 # (default.nix) and the host shell (shell.nix) so the two cannot drift apart.
 #
 # Drift is the reason this is its own file, the same reason it is one in
-# storage-bench: a host run missing cmark-gfm still kills every pod it was
-# going to and then hands back a report that was never rendered — the kind of
-# difference you notice after the cluster has already been disturbed.
+# storage-bench: a host run missing cmark-gfm or typst still kills every pod
+# it was going to and then hands back a report that was never rendered — the
+# kind of difference you notice after the cluster has already been disturbed.
 
 pkgs:
 
@@ -28,6 +28,27 @@ let
   # is a GFM extension rather than CommonMark, so plain `cmark` will not do,
   # and `--unsafe` is what lets the inline SVG through.
   cmark-gfm = pkgs.cmark-gfm;
+
+  # Renders the same report.md as report.pdf. The one dependency here whose
+  # size is not an afterthought: a single static Rust binary that takes the
+  # image from 142 MB to 196 MB, 42 MB of it typst and 9 MB the openssl it
+  # links for a package registry this image never reaches. `just size` is what
+  # says whether that is still the number after a nixpkgs bump.
+  #
+  # It is here because everything else that produces a PDF is worse by a wide
+  # margin. Measured against this same pin, on top of the closure as it stood:
+  # pandoc is +233 MB and still needs an engine underneath it (+276 MB with
+  # typst as that engine — a Haskell runtime whose job is to reach typst),
+  # weasyprint is +260 MB of Python, wkhtmltopdf is +153 MB of unmaintained
+  # WebKit, and headless chromium is +1.7 GB. Only lowdown piped into
+  # `groff -Tpdf` beats it, at +12 MB — and roff has no way to place an SVG,
+  # which would cost the report all four of its charts.
+  #
+  # typst reads those charts itself, because resvg is built into it. That is
+  # what keeps this to one package: no rasteriser, no librsvg, and no second
+  # renderer that has to agree with the *_svg functions about what a chart
+  # looks like.
+  typst = pkgs.typst;
 in
 {
   # gawk does all the parsing and all the drawing: it turns kubectl's
@@ -43,11 +64,12 @@ in
   #
   # gnugrep and gnused are small and are what the script reaches for around the
   # edges; gnutar and gzip are absent deliberately, unlike in storage-bench — a
-  # finished chaos run is five files, not a few thousand, so there is nothing
-  # to tar up.
+  # finished chaos run is a dozen files, not a few thousand, so there is
+  # nothing to tar up.
   packages = [
     kubectl
     cmark-gfm
+    typst
   ] ++ (with pkgs; [
     bashInteractive
     coreutils

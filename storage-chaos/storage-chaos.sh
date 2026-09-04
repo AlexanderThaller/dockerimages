@@ -171,7 +171,7 @@ TUNABLE_SPEC=(
   "POLL|1|seconds between readiness checks"
   "MIN_READY|0|ready pods a group must be left with"
   "DRY_RUN|0|1|0, resolve and report, delete nothing"
-  "REPORT|html|html, md or none"
+  "REPORT|html|html and pdf, md or none"
   "HOLD|0|seconds to stay alive after the report"
   "KUBECTL|kubectl|client to use; may carry flags"
 )
@@ -265,10 +265,11 @@ Replotting:
     Rebuilds the charts and the report from a previous run's own events.csv,
     config.env and plan.txt, without touching a cluster — for trying a change
     to the drawing or reporting code against a real run, or for rendering a
-    report that REPORT=none (or a missing cmark-gfm) skipped the first time.
-    An environment variable set alongside --replot still wins over the run's
-    own config.env, so REPORT=html storage-chaos.sh --replot <dir> renders
-    html out of a run that used REPORT=md. Needs no cluster access at all.
+    report that REPORT=none (or a missing cmark-gfm or typst) skipped the
+    first time. An environment variable set alongside --replot still wins over
+    the run's own config.env, so REPORT=html storage-chaos.sh --replot <dir>
+    renders html and pdf out of a run that used REPORT=md. Needs no cluster
+    access at all.
 
 Needs a ServiceAccount that may get, list and delete pods in the target
 namespaces. Out of cluster it uses KUBECONFIG; in cluster it finds the mounted
@@ -1558,6 +1559,312 @@ MDEOF
   printf '```\n'
 }
 
+# Markdown -> typst, for the Markdown report_md() writes and no other. The
+# input is a known subset — headings, pipe tables, fenced code, image-only
+# paragraphs, bullets, and inline `code`, **strong**, _emphasis_ and
+# intra-document links — so this is a converter, not a parser, and it is
+# allowed to be wrong about anything report_md() never emits.
+#
+# The .md stays the one source the PDF and the HTML are both made from, which
+# is what keeps --replot able to rebuild either of them from an old run.
+#
+# The file is read twice: the first pass collects the heading anchors, because
+# a link can point at a section further down and typst refuses to compile a
+# reference to a label that does not exist yet.
+md_to_typst() { # <markdown>
+  awk '
+    # Every heading gets a label, whether or not anything points at one yet:
+    # report_md() has no intra-document links today, and the slugs are the
+    # GitHub-compatible ones — lowercased, punctuation dropped, spaces
+    # hyphenated, duplicates suffixed — so the day it grows a `](#section)`
+    # link it resolves here, in a browser and on a forge without a second
+    # scheme to keep in step.
+    function slugify(s,   t) {
+      t = tolower(s)
+      gsub(/`/, "", t)
+      gsub(/\*\*/, "", t)
+      gsub(/[^a-z0-9 _-]/, "-", t)
+      gsub(/ +/, "-", t)
+      gsub(/-+/, "-", t)
+      sub(/^-/, "", t)
+      sub(/-$/, "", t)
+      return t
+    }
+
+    function anchor(s,   base) {
+      base = slugify(s)
+      if (base == "") base = "section"
+      if (base in seen) { base = base "-" seen[base]; seen[base]++ }
+      else seen[base] = 1
+      return base
+    }
+
+    # Every character typst reads as markup, escaped one at a time rather than
+    # with a chain of gsubs: the replacement string in gsub eats backslashes of
+    # its own, and getting that wrong is silent — it does not fail, it drops
+    # the character.
+    #
+    # The second dash of a `--` and the second dot of a `...` go too. Typst
+    # folds those into an en dash and an ellipsis, which is right for prose and
+    # wrong for `--replot`; the prose here already uses the em dashes it means.
+    function esc(s,   i, c, prev, out) {
+      out = ""
+      prev = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (index("\\#$@<>*_~`[]", c) || (c == prev && (c == "-" || c == ".")))
+          out = out "\\" c
+        else out = out c
+        prev = c
+      }
+      return out
+    }
+
+    # A typst string literal, for the arguments that are not markup: raw block
+    # bodies, image paths, link targets.
+    function str(s,   i, c, out) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else out = out c
+      }
+      return "\"" out "\""
+    }
+
+    # Inline markup. match() on the alternation finds the leftmost token; what
+    # precedes it is escaped, the token is translated, and the rest goes round
+    # again. RSTART and RLENGTH are read out before anything recurses, because
+    # they are global and the recursive call overwrites them.
+    function inl(s,   out, tok, body, alt, src, txt, url, a) {
+      out = ""
+      while (length(s) > 0) {
+        if (!match(s, /`[^`]*`|\*\*[^*]+\*\*|!\[[^]]*\]\([^)]*\)|\[[^]]*\]\([^)]*\)|_[^_]+_/)) {
+          out = out esc(s)
+          break
+        }
+        out = out esc(substr(s, 1, RSTART - 1))
+        tok = substr(s, RSTART, RLENGTH)
+        s = substr(s, RSTART + RLENGTH)
+
+        if (substr(tok, 1, 1) == "`") {
+          # Raw is literal in typst and uses the same delimiter, so a code span
+          # travels as it stands.
+          out = out tok
+        } else if (substr(tok, 1, 2) == "**") {
+          out = out "*" esc(substr(tok, 3, length(tok) - 4)) "*"
+        } else if (substr(tok, 1, 2) == "![") {
+          body = substr(tok, 3)
+          alt = substr(body, 1, index(body, "](") - 1)
+          src = substr(body, index(body, "](") + 2)
+          sub(/\)$/, "", src)
+          out = out "#box(image(" str(src) "))"
+        } else if (substr(tok, 1, 1) == "[") {
+          body = substr(tok, 2)
+          txt = substr(body, 1, index(body, "](") - 1)
+          url = substr(body, index(body, "](") + 2)
+          sub(/\)$/, "", url)
+          if (substr(url, 1, 1) == "#") {
+            a = substr(url, 2)
+            # A link to a section this document does not have is left as plain
+            # text: typst treats a dangling label as a hard error, and losing
+            # the link is a better outcome than losing the report.
+            out = out (a in target ? "#link(<sec-" a ">)[" inl(txt) "]" : inl(txt))
+          } else {
+            out = out "#link(" str(url) ")[" inl(txt) "]"
+          }
+        } else {
+          out = out "_" esc(substr(tok, 2, length(tok) - 2)) "_"
+        }
+      }
+      return out
+    }
+
+    function flushpara() {
+      if (para != "") print inl(para) "\n"
+      para = ""
+    }
+
+    # One pipe table row, with the empties the leading and trailing bars leave
+    # behind dropped.
+    function cells(line, arr,   i, n, tmp) {
+      sub(/^\|/, "", line)
+      sub(/\|[ \t]*$/, "", line)
+      n = split(line, tmp, /\|/)
+      for (i = 1; i <= n; i++) {
+        arr[i] = tmp[i]
+        sub(/^[ \t]+/, "", arr[i])
+        sub(/[ \t]+$/, "", arr[i])
+      }
+      return n
+    }
+
+    # Row two of a GFM table is the alignment row, and it is the only place
+    # that says which columns are numbers: `---:` is how report_md() marks a
+    # column meant to be read down rather than across.
+    function flushtable(   i, j, n, c, a, al, out) {
+      if (trows == 0) return
+      n = cells(trow[1], c)
+      al = ""
+      if (trows >= 2) {
+        split("", a)
+        cells(trow[2], a)
+        for (i = 1; i <= n; i++)
+          al = al (i > 1 ? ", " : "") (a[i] ~ /:$/ ? "right" : "left")
+      }
+      print "#tbl("
+      printf "  columns: %d,\n", n
+      if (al != "") printf "  align: (%s),\n", al
+      out = "  table.header("
+      for (i = 1; i <= n; i++) out = out (i > 1 ? ", " : "") "[" inl(c[i]) "]"
+      print out "),"
+      for (i = 3; i <= trows; i++) {
+        split("", c)
+        cells(trow[i], c)
+        out = "  "
+        for (j = 1; j <= n; j++) out = out (j > 1 ? ", " : "") "[" inl(c[j]) "]"
+        print out ","
+      }
+      print ")\n"
+      trows = 0
+    }
+
+    FNR == NR {
+      if ($0 ~ /^```/) { p1fence = !p1fence; next }
+      if (!p1fence && $0 ~ /^#{1,6} /) target[anchor(substr($0, index($0, " ") + 1))] = 1
+      next
+    }
+
+    FNR == 1 { split("", seen) }
+
+    # A fence body is handed to raw() as a string rather than rebuilt as a
+    # typst backtick block, so a fence that holds backticks of its own cannot
+    # end the block early.
+    fence {
+      if ($0 ~ /^```/) { print "#raw(block: true, " str(fbody) ")\n"; fence = 0; next }
+      fbody = fbody (fbody == "" ? "" : "\n") $0
+      next
+    }
+    /^```/ { flushpara(); flushtable(); fence = 1; fbody = ""; next }
+
+    /^\|/ { flushpara(); trow[++trows] = $0; next }
+    trows { flushtable() }
+
+    /^#{1,6} / {
+      flushpara()
+      lvl = index($0, " ") - 1
+      txt = substr($0, lvl + 2)
+      printf "%s %s <sec-%s>\n\n", substr("======", 1, lvl), inl(txt), anchor(txt)
+      next
+    }
+
+    # An image on its own line is a figure and its alt text is the caption —
+    # the same reading render_html() gives it.
+    /^!\[[^]]*\]\([^)]*\)[ \t]*$/ {
+      flushpara()
+      body = substr($0, 3)
+      alt = substr(body, 1, index(body, "](") - 1)
+      src = substr(body, index(body, "](") + 2)
+      sub(/\)[ \t]*$/, "", src)
+      print "#figure(image(" str(src) ", width: 100%), caption: [" inl(alt) "])\n"
+      next
+    }
+
+    /^[*-] / { flushpara(); inlist = 1; print "- " inl(substr($0, 3)); next }
+
+    # A bullet continued on the next line is indented; a blank line ends the
+    # list.
+    inlist && /^[ \t]+[^ \t]/ { print "  " inl(substr($0, match($0, /[^ \t]/))); next }
+    inlist && /^[ \t]*$/ { inlist = 0; print ""; next }
+
+    /^[ \t]*$/ { flushpara(); next }
+
+    { para = para (para == "" ? "" : " ") $0 }
+
+    END { flushpara(); flushtable(); if (fence) print "#raw(block: true, " str(fbody) ")" }
+  ' "$1" "$1"
+}
+
+# The preamble, and then the .md converted under it. This is kept as a file in
+# the run directory rather than piped straight into typst, for the same reason
+# graphs/render-chart.awk is a file in storage-bench: it is what someone
+# rebuilds the PDF from on a machine that has typst when this one did not, and
+# it is the first place to look when a page comes out wrong — a layout
+# complaint is about a line of this, not about a line of the Markdown.
+render_typst() { # <markdown> <typst out>
+  {
+    cat <<'TYPEOF'
+#set page(paper: "a4", margin: (x: 1.6cm, y: 1.8cm), numbering: "1 / 1")
+#set text(size: 9.5pt)
+// The prose is written with the characters it means, and a pod name in a
+// table is not prose, so typst's quote curling stays off.
+#set smartquote(enabled: false)
+#set par(justify: false, leading: 0.62em, spacing: 1.1em)
+#show raw: set text(font: "DejaVu Sans Mono", size: 8pt)
+#show link: set text(fill: rgb("#1a6ec4"))
+#show figure: set block(breakable: false)
+#set figure(gap: 0.7em)
+#show figure.caption: set text(size: 8.5pt, fill: luma(90))
+
+// The h1 is the report's title and carries no number of its own, so the
+// numbering starts at the h2 and reads 1., 1.1.
+#set heading(numbering: (..n) => {
+  let p = n.pos()
+  if p.len() > 1 { numbering("1.1.", ..p.slice(1)) }
+})
+#show heading.where(level: 1): set text(size: 17pt)
+#show heading.where(level: 2): it => block(width: 100%, above: 1.6em, below: 0.9em)[
+  #it
+  #v(-0.5em)
+  #line(length: 100%, stroke: 0.5pt + luma(200))
+]
+
+// The HTML answers a table wider than the window with a horizontal scrollbar.
+// A page has no such thing, so a wide table is either scaled a little or —
+// once scaling would take it below reading size — turned sideways onto a page
+// of its own. The kills table is eight columns of pod names and lands in the
+// second case.
+//
+// The widths are spelled out rather than measured because measuring the space
+// actually available means layout(), and page() is not allowed inside a
+// container.
+#let w-page = 21cm - 3.2cm
+#let w-flipped = 29.7cm - 3.2cm
+#let tbl(..args) = context {
+  let t = table(stroke: 0.4pt + luma(200), inset: (x: 5pt, y: 3.5pt), ..args)
+  let nat = measure(t).width
+  let fit(w) = {
+    let f = calc.min(1.0, w / nat)
+    if f >= 0.999 { t } else { block(width: w, scale(t, x: f * 100%, y: f * 100%, reflow: true)) }
+  }
+  if nat <= w-page / 0.85 { fit(w-page) } else { page(flipped: true, fit(w-flipped)) }
+}
+#show table.cell.where(y: 0): strong
+#set table(fill: (_, y) => if calc.odd(y) and y > 0 { luma(247) })
+
+// Level 1 is the title, so the contents page starts at the sections under it.
+#show outline.entry.where(level: 1): none
+#outline(title: [Contents], depth: 3)
+TYPEOF
+    echo
+    md_to_typst "$1"
+  } >"$2"
+}
+
+# typst reads the chart SVGs itself — resvg is built into it — so nothing here
+# rasterises anything and no second renderer has to agree with the *_svg
+# functions about what a chart looks like.
+#
+# --ignore-system-fonts is what makes a host run and a container run produce
+# the same pages: the image has no fonts at all beyond the four typst carries,
+# and a laptop that quietly substituted its own would be the same drift
+# runtime-deps.nix exists to prevent. The four are enough — the charts ask for
+# `system-ui, sans-serif` and land on the bundled serif, labels intact.
+render_pdf() { # <typst source> <pdf out> <directory the image paths are relative to>
+  typst compile --ignore-system-fonts --root "$3" "$1" "$2"
+}
+
 render_html() { # <markdown> <html out> <svg directory>
   {
     cat <<'HEADEOF'
@@ -1674,6 +1981,30 @@ long. This one is kept for the hover text, which still names every pod.
       info "report: $OUTDIR/report.html"
     else
       warn "cmark-gfm not on PATH — the report stays as Markdown"
+    fi
+
+    # The typst source is written whether or not there is a typst to compile
+    # it, the same way the Markdown is written whether or not there is a
+    # cmark-gfm: converting costs one pass of awk, and a run that ends without
+    # the binary it needed should still hand back everything the binary would
+    # have been given.
+    render_typst "$OUTDIR/report.md" "$OUTDIR/report.typ"
+    info "report: $OUTDIR/report.typ"
+
+    # The PDF is its own renderer and its own failure: a typst that is missing,
+    # or that chokes on something the converter got wrong, must not cost the
+    # HTML that has already been written. The .typ stays behind either way —
+    # on a failure it is the evidence.
+    if command -v typst >/dev/null 2>&1; then
+      if render_pdf "$OUTDIR/report.typ" "$OUTDIR/report.pdf" "$OUTDIR" \
+        2>"$TMP/typst.log"; then
+        info "report: $OUTDIR/report.pdf"
+      else
+        rm -f "$OUTDIR/report.pdf"
+        warn "typst failed — no PDF; $(head -n 3 "$TMP/typst.log" | tr '\n' ' ')"
+      fi
+    else
+      warn "typst not on PATH — no PDF; report.typ is what compiles it elsewhere"
     fi
   fi
 }
@@ -1885,7 +2216,8 @@ run_loop() {
 # job storage-bench.sh's --replot does, and for the same reason: it is how a
 # change to write_report()/the *_svg functions gets tried against a real run
 # rather than a fresh one, and how a run whose report was never rendered
-# (REPORT=none, or cmark-gfm missing at the time) gets one after the fact.
+# (REPORT=none, or cmark-gfm or typst missing at the time) gets one after the
+# fact.
 #
 # events.csv is the only file this strictly needs; config.env and plan.txt
 # fill in the rest — the tunables and the namespaces — best-effort, falling

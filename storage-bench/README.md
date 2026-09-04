@@ -2,7 +2,7 @@
 
 A storage benchmark that measures one or more mounted filesystems with `fio`
 and then with a real PostgreSQL workload, and writes a single self-contained
-HTML report with time-series graphs.
+HTML report with time-series graphs, and the same report as a PDF.
 
 Everything is configured through environment variables. The only arguments are
 the paths to benchmark.
@@ -138,14 +138,15 @@ the uid has no `/etc/passwd` entry and one cannot be added.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PLOT` | `1` | `0` skips the graphs. The report says so, and the raw time-series logs are still written. |
-| `RENDER` | `html` | `none` writes only the Markdown. The HTML is a single self-contained file with the graphs inlined. |
+| `RENDER` | `html` | Renders the report as both HTML and PDF; `none` writes only the Markdown. The HTML is a single self-contained file with the graphs inlined; the PDF is typeset by `typst`, which reads the same SVGs directly. |
 
 Graphs are drawn by awk (`graphs/render-chart.awk`) rather than gnuplot — every
 chart is real SVG with a hover tooltip baked in, so the same file that renders
 in a browser lets you read values off it. `./storage-bench.sh --replot <results-dir>`
-redraws the graphs and rebuilds the report from a previous run's own logs and
-CSVs, without touching fio or pgbench again — the way to try a change to the
-drawing or reporting code against a real run.
+redraws the graphs and rebuilds all three reports from a previous run's own
+logs and CSVs, without touching fio or pgbench again — the way to try a change
+to the drawing or reporting code against a real run, and the way to get the
+HTML or the PDF that a run without `cmark-gfm` or `typst` on PATH skipped.
 
 ## Justfile targets
 
@@ -191,6 +192,8 @@ bench-results-<timestamp>.tar.gz     the whole directory below, in one file
 bench-results-<timestamp>/
 ├── storage-benchmark-report.md      the report, readable as-is
 ├── storage-benchmark-report.html    the same, self-contained, graphs inlined
+├── storage-benchmark-report.pdf     the same again, paginated, for sending on
+├── storage-benchmark-report.typ     the typst source the PDF was compiled from
 ├── fio_results.csv                  one row per (pass, mount, test)
 ├── pgbench_results.csv              one row per (pass, mount)
 ├── graphs/
