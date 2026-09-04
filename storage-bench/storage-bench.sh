@@ -2786,7 +2786,11 @@ render_typst() { # <markdown> <typst out>
   {
     cat <<'TYPEOF'
 #set page(paper: "a4", margin: (x: 1.6cm, y: 1.8cm), numbering: "1 / 1")
-#set text(size: 9.5pt)
+// Fira Sans, which runtime-deps.nix puts on TYPST_FONT_PATHS. It is also what
+// the charts end up in: their SVG asks for `system-ui, sans-serif`, and with
+// --ignore-system-fonts this is the only sans typst knows, so the axis labels
+// and the prose around them come out of the same family for once.
+#set text(font: "Fira Sans", size: 9.5pt)
 // The prose is written with the characters it means, and a pod name in a
 // table is not prose, so typst's quote curling stays off.
 #set smartquote(enabled: false)

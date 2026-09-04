@@ -32,8 +32,9 @@ let
   # Renders the same report.md as report.pdf. The one dependency here whose
   # size is not an afterthought: a single static Rust binary that takes the
   # image from 142 MB to 196 MB, 42 MB of it typst and 9 MB the openssl it
-  # links for a package registry this image never reaches. `just size` is what
-  # says whether that is still the number after a nixpkgs bump.
+  # links for a package registry this image never reaches. The font below
+  # takes it to 198 MB. `just size` is what says whether those are still the
+  # numbers after a nixpkgs bump.
   #
   # It is here because everything else that produces a PDF is worse by a wide
   # margin. Measured against this same pin, on top of the closure as it stood:
@@ -49,6 +50,23 @@ let
   # renderer that has to agree with the *_svg functions about what a chart
   # looks like.
   typst = pkgs.typst;
+
+  # Fira Sans, four faces of it, for the PDF. The stock package is 98 MB: 92
+  # OpenType files and the same 92 again as TrueType, every weight from Hair
+  # to Ultra with an italic each, where this report sets one family and asks
+  # it for regular, italic, bold and bold italic. Those four are 2 MB, and
+  # typst has to open every font it is pointed at before it can lay out a
+  # page, so the other 180 cost start-up time as well as image.
+  #
+  # A copy rather than an override because there is no build to hook: the
+  # package unpacks an archive of fonts and installs all of them.
+  fira-sans = pkgs.runCommand "fira-sans-report" { } ''
+    mkdir -p $out/share/fonts/opentype
+    for f in Regular Italic Bold BoldItalic; do
+      cp ${pkgs.fira-sans}/share/fonts/opentype/FiraSans-$f.otf \
+        $out/share/fonts/opentype/
+    done
+  '';
 in
 {
   # gawk does all the parsing and all the drawing: it turns kubectl's
@@ -70,6 +88,7 @@ in
     kubectl
     cmark-gfm
     typst
+    fira-sans
   ] ++ (with pkgs; [
     bashInteractive
     coreutils
@@ -77,4 +96,10 @@ in
     gnugrep
     gnused
   ]);
+
+  # Where typst is told to find them. It is passed `--ignore-system-fonts`, so
+  # it will not go looking on its own — which is the point, and is what makes
+  # a host run and a container run set the same type. default.nix exports this
+  # into the script's own environment and shell.nix into the host shell.
+  fontPath = "${fira-sans}/share/fonts";
 }

@@ -29,7 +29,8 @@ let
 
   # Shared with shell.nix, which is what gives a host run the same tools the
   # image has. See runtime-deps.nix for what each one is for.
-  runtimeDeps = (import ./runtime-deps.nix pkgsLinux).packages;
+  runtime = import ./runtime-deps.nix pkgsLinux;
+  runtimeDeps = runtime.packages;
 
   # The script gets an absolute interpreter and an absolute PATH, so it behaves
   # identically no matter what PATH the caller (Kubernetes, docker run -e, ...)
@@ -40,7 +41,8 @@ let
     install -Dm755 ${./storage-chaos.sh} $out/bin/storage-chaos
     substituteInPlace $out/bin/storage-chaos \
       --replace-fail '#!/usr/bin/env bash' '#!${pkgsLinux.bashInteractive}/bin/bash
-    export PATH=${lib.makeBinPath runtimeDeps}''${PATH:+:$PATH}'
+    export PATH=${lib.makeBinPath runtimeDeps}''${PATH:+:$PATH}
+    export TYPST_FONT_PATHS=${runtime.fontPath}'
   '';
 in
 

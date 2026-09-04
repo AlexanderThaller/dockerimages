@@ -11,9 +11,10 @@ writes included — which is always less, and is the number an application would
 recognise.
 
 No distro userland, no package manager: the image is a Nix closure of fio,
-postgresql, cmark-gfm, typst and bash — 62 MB compressed, 178 MB on disk. The
+postgresql, cmark-gfm, typst and bash — 63 MB compressed, 181 MB on disk. The
 graphs are drawn by awk itself, so there is no gnuplot or other rasteriser in
-here; typst reads those SVGs directly to put them in the PDF.
+here; typst reads those SVGs directly to put them in the PDF, and sets them in
+the same Fira Sans as the prose.
 
 ## Run it
 

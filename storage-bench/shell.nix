@@ -11,6 +11,15 @@
 
 { pkgs ? import (import ./nixpkgs.nix) { } }:
 
+let
+  runtime = import ./runtime-deps.nix pkgs;
+in
+
 pkgs.mkShell {
-  packages = (import ./runtime-deps.nix pkgs).packages;
+  packages = runtime.packages;
+
+  # typst is run with --ignore-system-fonts, so this is the only way it finds
+  # Fira Sans. Without it a host run would quietly typeset the PDF in typst's
+  # bundled serif and look nothing like the one the image produces.
+  TYPST_FONT_PATHS = runtime.fontPath;
 }

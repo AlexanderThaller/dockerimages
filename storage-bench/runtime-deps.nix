@@ -64,10 +64,11 @@ let
 
   # Renders the same Markdown as storage-benchmark-report.pdf. This is the one
   # dependency here whose size is not an afterthought: a single static Rust
-  # binary that takes the image from 133 MB to 178 MB. It is 45 MB rather than
-  # the 51 MB it costs storage-chaos because the openssl typst links — for a
-  # package registry this image never reaches — is already here behind
-  # postgresql. `just size` is what says whether that holds after a bump.
+  # binary that takes the image from 133 MB to 178 MB, and to 181 MB once the
+  # font below is in. It is 45 MB rather than the 51 MB it costs storage-chaos
+  # because the openssl typst links — for a package registry this image never
+  # reaches — is already here behind postgresql. `just size` is what says
+  # whether that holds after a bump.
   #
   # It is here because everything else that produces a PDF is worse by a wide
   # margin. Measured against this same pin, on top of the closure as it stood:
@@ -85,6 +86,23 @@ let
   # like. The crosshair script baked into each SVG is ignored, which is the
   # right answer for paper.
   typst = pkgs.typst;
+
+  # Fira Sans, four faces of it, for the PDF. The stock package is 98 MB: 92
+  # OpenType files and the same 92 again as TrueType, every weight from Hair
+  # to Ultra with an italic each, where this report sets one family and asks
+  # it for regular, italic, bold and bold italic. Those four are 2 MB, and
+  # typst has to open every font it is pointed at before it can lay out a
+  # page, so the other 180 cost start-up time as well as image.
+  #
+  # A copy rather than an override because there is no build to hook: the
+  # package unpacks an archive of fonts and installs all of them.
+  fira-sans = pkgs.runCommand "fira-sans-report" { } ''
+    mkdir -p $out/share/fonts/opentype
+    for f in Regular Italic Bold BoldItalic; do
+      cp ${pkgs.fira-sans}/share/fonts/opentype/FiraSans-$f.otf \
+        $out/share/fonts/opentype/
+    done
+  '';
 
   # The non-synthetic half of the benchmark. pgbench ships inside the main
   # postgresql output, so this one package covers initdb, the server and the
@@ -145,6 +163,7 @@ in
     fio
     cmark-gfm
     typst
+    fira-sans
     postgresql
   ] ++ (with pkgs; [
     bashInteractive
@@ -161,4 +180,10 @@ in
     gnutar
     gzip
   ]);
+
+  # Where typst is told to find them. It is passed `--ignore-system-fonts`, so
+  # it will not go looking on its own — which is the point, and is what makes
+  # a host run and a container run set the same type. default.nix exports this
+  # into the script's own environment and shell.nix into the host shell.
+  fontPath = "${fira-sans}/share/fonts";
 }
