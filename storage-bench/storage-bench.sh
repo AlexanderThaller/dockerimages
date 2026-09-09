@@ -1930,8 +1930,15 @@ csv_table() { # <csvfile>
 # Grouping by mount and then test also means this cannot simply walk the CSV:
 # under `ORDER=by-test` the rows interleave the mounts, so the mounts and the
 # tests are collected in first-appearance order separately and nested here.
-fio_aggregate_table() { # <csvfile>
-  awk -F, '
+#
+# pgbench is folded in the same way and comes out as one more table under each
+# mount, after the fio ones. Its CSV has its own columns and its own units, but
+# a pass is a pass and the question — what did this mount do, and how much did
+# it vary while doing it — is the same question, so it would be perverse to
+# answer it twice in two places. It is read second, which is also why it lands
+# last under each mount.
+aggregate_section() { # <fio csv> [pgbench csv]
+  awk -F, -v fiocsv="$1" '
     # Enough digits to tell two passes apart without implying fio measured to
     # that precision: whole numbers once past 100, where a decimal would be
     # noise, and two of them below 10, where dropping them would round a
@@ -1980,21 +1987,44 @@ fio_aggregate_table() { # <csvfile>
       printf "these numbers.\n\n"
     }
 
-    NR == 1 { next }
-    {
-      key = $2 SUBSEP $3
+    # One pass of one mount-and-test, from whichever CSV it came out of. `lo`
+    # and `hi` bracket the columns that carry numbers — 4 to 9 in the fio CSV,
+    # 9 to 11 in the pgbench one — and the values keep their own column index,
+    # which cannot collide across the two because no key is in both files.
+    function record(lo, hi,   i, k) {
+      key = $2 SUBSEP tname
       if (!(key in seen)) {
         seen[key] = 1
         if (!($2 in ismount)) { ismount[$2] = 1; mo[++nm] = $2 }
-        if (!($3 in istest)) { istest[$3] = 1; to[++nt] = $3 }
+        if (!(tname in istest)) { istest[tname] = 1; to[++nt] = tname }
       }
       # FAILED rows are left out rather than counted as zero, which would pull
       # a min to the floor and read as a very slow pass rather than as no pass
       # at all. The note above each table is what says they happened.
-      for (i = 4; i <= 9; i++)
-        if ($i !~ /^[0-9]+(\.[0-9]+)?$/) { bad[key]++; next }
+      for (i = lo; i <= hi; i++)
+        if ($i !~ /^[0-9]+(\.[0-9]+)?$/) { bad[key]++; return }
       k = ++n[key]
-      for (i = 4; i <= 9; i++) v[key, i, k] = $i + 0
+      for (i = lo; i <= hi; i++) v[key, i, k] = $i + 0
+    }
+
+    FNR == 1 { next }
+
+    FILENAME == fiocsv { tname = $3; record(4, 9); next }
+
+    # pgbench: run,mount,scale,clients,threads,mode,warmup_s,duration_s,
+    #          init_s,tps,latency_avg_ms,transactions,failed
+    #
+    # `transactions` is `tps` times a fixed duration and says nothing the tps
+    # row does not. `failed` is picked up separately: it is a count of
+    # rollbacks rather than a measurement, and zero is the answer that needs
+    # no row.
+    {
+      tname = "pgbench"
+      record(9, 11)
+      # record() has just set `key`. The worst pass is the one worth carrying:
+      # a rate that held up in two passes out of three and collapsed in the
+      # third is not a rate that held up.
+      if ($13 ~ /^[0-9]+$/ && $13 + 0 > rolledback[key]) rolledback[key] = $13 + 0
     }
 
     END {
@@ -2007,22 +2037,36 @@ fio_aggregate_table() { # <csvfile>
           passnote(key)
 
           body = ""
-          got = row(key, 4, "Read IOPS", 1)
-          got += row(key, 5, "Read MiB/s", 1 / 1024)
-          got += row(key, 6, "Read clat µs", 1)
-          got += row(key, 7, "Write IOPS", 1)
-          got += row(key, 8, "Write MiB/s", 1 / 1024)
-          got += row(key, 9, "Write clat µs", 1)
+          if (to[ti] == "pgbench") {
+            got = row(key, 10, "TPS", 1)
+            got += row(key, 11, "Mean latency ms", 1)
+            got += row(key, 9, "Load time s", 1)
+          } else {
+            got = row(key, 4, "Read IOPS", 1)
+            got += row(key, 5, "Read MiB/s", 1 / 1024)
+            got += row(key, 6, "Read clat µs", 1)
+            got += row(key, 7, "Write IOPS", 1)
+            got += row(key, 8, "Write MiB/s", 1 / 1024)
+            got += row(key, 9, "Write clat µs", 1)
+          }
           if (got == 0)
             printf "%s\n\n", (n[key] \
               ? "Every pass ran and none of them reported anything above zero." \
               : "Every pass failed, so there is nothing to aggregate here.")
-          else
+          else {
             printf "| Metric | Min | Median | Max |\n| --- | ---: | ---: | ---: |\n%s\n", body
+            # Said after the table rather than as a row in it, because a
+            # rollback is not a measurement of the storage and a reader who
+            # sees one wants to stop reading the rest of the table, not
+            # average it.
+            if (rolledback[key] > 0)
+              printf "%d transactions rolled back in the worst pass, which makes the\ntransaction rate above an upper bound rather than a result.\n\n", \
+                rolledback[key]
+          }
         }
       }
     }
-  ' "$1"
+  ' "$@"
 }
 
 # Which set of charts belongs next to the prose. With more than one pass that
@@ -2125,8 +2169,8 @@ log "Writing report"
 * A ${SETTLE}s idle period separates consecutive runs, and a shorter ${TEST_SETTLE}s one separates consecutive tests within a run, so that one job's writeback does not land inside the next job's first samples.
 * What each fio job measures, and the exact command it ran, is in [fio tests](#fio-tests) — including the flags all of them share, such as \`--direct=1\` to keep the page cache out of the results. If you read one section before the numbers, read that one.
 * \`seq_write_1m\`, \`seq_write_zero_1m\` and \`seq_write_rand_1m\` are the same job with different data in the buffer: whatever fio writes by default, all zeros, and fresh random bytes per block. On a backend that stores what it is given they are one number three times. Where they diverge, the backend is looking at the content — zeros compressing away, or identical blocks being deduplicated — and the write figures for real data are somewhere between the two extremes rather than at either.
-* If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
-* fio measures the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
+* If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench-workload).
+* fio measures the storage. [pgbench](#pgbench-workload) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
 * Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio$([ "$REPEATS" -gt 1 ] && echo ", except in [aggregated results](#aggregated-results), which is in MiB/s").
 * The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. The time-series chart under each test in [fio tests](#fio-tests) is where that shows.
 
@@ -2146,8 +2190,8 @@ EOF
     echo
   done
 
-  # ---- the whole suite in one table --------------------------------------
-  # Ahead of the charts and ahead of the per-pass table, because it is the
+  # ---- the whole suite in one section -------------------------------------
+  # Ahead of the charts and ahead of the per-pass tables, because it is the
   # answer to the question most readers open this with. Only worth printing
   # with more than one pass: with a single pass every cell would be the same
   # number three times, and `## fio results` below already is that table.
@@ -2158,8 +2202,8 @@ EOF
 Every pass folded together: a table per mount and test, one row per metric,
 holding the median of the ${REPEATS} passes with the slowest and the fastest
 pass either side of it. The passes themselves are in
-[fio results](#fio-results); this is the same numbers with the arithmetic
-already done.
+[fio results](#fio-results) and [pgbench](#pgbench-workload); this is the same numbers
+with the arithmetic already done.
 
 Read the median as what to expect and the distance between min and max as how
 much the storage disagreed with itself from one pass to the next. A tight
@@ -2181,7 +2225,26 @@ to failures says how many it kept, and one that lost all of them says that
 instead of showing a table.
 
 EOF
-    fio_aggregate_table "$FIO_CSV"
+
+    # Only when there is pgbench data to fold; the sentence would otherwise
+    # promise a table that is not there.
+    if [ "$have_pgbench" = 1 ]; then
+      cat <<'EOF'
+Each mount ends with `pgbench`, folded the same way: transaction rate, mean
+commit latency, and the seconds `pgbench` spent loading the data before the
+timed run started. It is here rather than down in [pgbench](#pgbench-workload) because
+it is a pass over this mount like any other, and because it is the one number
+in this section an application would recognise — the fio rows say what the
+storage can do, that row says what a database got out of it. Rolled-back
+transactions are named under their table if there were any, and silently
+absent if there were none, which is the only answer needing no number.
+
+EOF
+    fi
+
+    agg_csvs=("$FIO_CSV")
+    [ "$have_pgbench" = 1 ] && agg_csvs+=("$PG_CSV")
+    aggregate_section "${agg_csvs[@]}"
     echo
   fi
 
@@ -2253,7 +2316,12 @@ MDEOF
 
   # ---- pgbench ----------------------------------------------------------
   echo
-  echo "## pgbench"
+  # Named "pgbench workload" rather than "pgbench" because the aggregated
+  # results now carry a `#### pgbench` of their own, earlier in the document,
+  # and two headings with one name means one of them gets the plain `#pgbench`
+  # anchor and the other a `-1` suffix. This is the section the report links
+  # to, so this is the one that gets a name of its own.
+  echo "## pgbench workload"
   echo
   if [ "$have_pgbench" = 1 ]; then
     cat <<EOF
