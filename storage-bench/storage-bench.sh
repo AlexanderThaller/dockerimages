@@ -1909,6 +1909,122 @@ csv_table() { # <csvfile>
   ' "$1"
 }
 
+# The per-pass rows of `## fio results` folded down to one small table per
+# mount and test: one row per metric, holding the median of that metric across
+# the passes with the slowest and fastest pass either side of it. The per-pass
+# table is the record, but a reader who wants "how fast is this mount at 4k
+# writes" should not have to scan REPEATS rows of it and do the arithmetic, and
+# with several mounts and nine tests those rows are not even adjacent.
+#
+# Median rather than mean because one pass that stalled drags a mean down and
+# leaves nothing behind saying it did, where it barely moves a median and shows
+# up in the min column instead — which is the honest way round for the number
+# a reader is going to quote.
+#
+# The mount and the test are headings rather than columns. As columns they were
+# the same two strings repeated down every row of a group, which is a lot of
+# table carrying no information; as headings they are stated once, they nest
+# the way the reader already thinks about the run, and what is left is four
+# columns wide — metric, and the three numbers the section exists for.
+#
+# Grouping by mount and then test also means this cannot simply walk the CSV:
+# under `ORDER=by-test` the rows interleave the mounts, so the mounts and the
+# tests are collected in first-appearance order separately and nested here.
+fio_aggregate_table() { # <csvfile>
+  awk -F, '
+    # Enough digits to tell two passes apart without implying fio measured to
+    # that precision: whole numbers once past 100, where a decimal would be
+    # noise, and two of them below 10, where dropping them would round a
+    # small-but-real difference away to nothing.
+    function fmt(v) {
+      if (v >= 100) return sprintf("%d", v + 0.5)
+      if (v >= 10) return sprintf("%.1f", v)
+      return sprintf("%.2f", v)
+    }
+
+    # One metric of one test appended to `body` as a row, or nothing at all
+    # when the job never issued in that direction — reads in a write test are
+    # zero in every pass, and a row of zeros claims a measurement that was
+    # never taken. It builds a string rather than printing because whether
+    # there is a table at all, header included, is only known once every
+    # metric has been asked, and a header with no rows under it is worse than
+    # the sentence that replaces it.
+    #
+    # Insertion sort because the array is REPEATS long — three, normally — and
+    # asort() would be the only gawk-only thing in here.
+    function row(key, col, label, scale,   i, j, m, a, t, mid) {
+      m = n[key]
+      for (i = 1; i <= m; i++) a[i] = v[key, col, i] * scale
+      for (i = 2; i <= m; i++) {
+        t = a[i]
+        for (j = i - 1; j >= 1 && a[j] > t; j--) a[j + 1] = a[j]
+        a[j + 1] = t
+      }
+      if (m == 0 || a[m] == 0) return 0
+      mid = (m % 2 ? a[(m + 1) / 2] : (a[m / 2] + a[m / 2 + 1]) / 2)
+      body = body sprintf("| %s | %s | %s | %s |\n", \
+        label, fmt(a[1]), fmt(mid), fmt(a[m]))
+      return 1
+    }
+
+    # Every table under a heading covers the same passes, so the count belongs
+    # in a sentence above it rather than in a column repeated down it — and
+    # only when it is not the whole story. Silence means every pass counted.
+    function passnote(key) {
+      # Nothing to qualify when every pass counted, and nothing to qualify
+      # either when none of them did — that case has a sentence of its own
+      # below and does not need this one contradicting it first.
+      if (bad[key] == 0 || n[key] == 0) return
+      printf "Aggregated over %d of %d passes; the rest failed and are not in\n", \
+        n[key] + 0, n[key] + bad[key]
+      printf "these numbers.\n\n"
+    }
+
+    NR == 1 { next }
+    {
+      key = $2 SUBSEP $3
+      if (!(key in seen)) {
+        seen[key] = 1
+        if (!($2 in ismount)) { ismount[$2] = 1; mo[++nm] = $2 }
+        if (!($3 in istest)) { istest[$3] = 1; to[++nt] = $3 }
+      }
+      # FAILED rows are left out rather than counted as zero, which would pull
+      # a min to the floor and read as a very slow pass rather than as no pass
+      # at all. The note above each table is what says they happened.
+      for (i = 4; i <= 9; i++)
+        if ($i !~ /^[0-9]+(\.[0-9]+)?$/) { bad[key]++; next }
+      k = ++n[key]
+      for (i = 4; i <= 9; i++) v[key, i, k] = $i + 0
+    }
+
+    END {
+      for (mi = 1; mi <= nm; mi++) {
+        printf "### %s\n\n", mo[mi]
+        for (ti = 1; ti <= nt; ti++) {
+          key = mo[mi] SUBSEP to[ti]
+          if (!(key in seen)) continue
+          printf "#### %s\n\n", to[ti]
+          passnote(key)
+
+          body = ""
+          got = row(key, 4, "Read IOPS", 1)
+          got += row(key, 5, "Read MiB/s", 1 / 1024)
+          got += row(key, 6, "Read clat µs", 1)
+          got += row(key, 7, "Write IOPS", 1)
+          got += row(key, 8, "Write MiB/s", 1 / 1024)
+          got += row(key, 9, "Write clat µs", 1)
+          if (got == 0)
+            printf "%s\n\n", (n[key] \
+              ? "Every pass ran and none of them reported anything above zero." \
+              : "Every pass failed, so there is nothing to aggregate here.")
+          else
+            printf "| Metric | Min | Median | Max |\n| --- | ---: | ---: | ---: |\n%s\n", body
+        }
+      }
+    }
+  ' "$1"
+}
+
 # Which set of charts belongs next to the prose. With more than one pass that
 # is the aggregate — the mean is the summary you want beside the explanation,
 # and the individual passes are detail that goes at the end. With one pass there
@@ -2011,7 +2127,7 @@ log "Writing report"
 * \`seq_write_1m\`, \`seq_write_zero_1m\` and \`seq_write_rand_1m\` are the same job with different data in the buffer: whatever fio writes by default, all zeros, and fresh random bytes per block. On a backend that stores what it is given they are one number three times. Where they diverge, the backend is looking at the content — zeros compressing away, or identical blocks being deduplicated — and the write figures for real data are somewhere between the two extremes rather than at either.
 * If you are comparing storage classes and only have time for one number, it is \`fsync_8k_qd1\` — or, if you would rather have one an application would recognise, the pgbench TPS in [pgbench](#pgbench).
 * fio measures the storage. [pgbench](#pgbench) measures what a database gets out of it, which is always less: the same commit that fio counts as one 8 KiB write is, in postgres, a WAL record, an fsync, a heap and index page to write back later, and a full-page image if a checkpoint has just been through. Where the two disagree about which mount is faster, pgbench is the one that resembles a workload.
-* Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio.
+* Latency columns are mean completion latency in microseconds. Bandwidth columns are KiB/s as reported by fio$([ "$REPEATS" -gt 1 ] && echo ", except in [aggregated results](#aggregated-results), which is in MiB/s").
 * The tables are whole-run averages. An average hides the shape of a run, and the shape is often the interesting part — a cache filling up, a throttle kicking in, a backend stalling. The time-series chart under each test in [fio tests](#fio-tests) is where that shows.
 
 ## Mount points
@@ -2029,6 +2145,45 @@ EOF
     echo '```'
     echo
   done
+
+  # ---- the whole suite in one table --------------------------------------
+  # Ahead of the charts and ahead of the per-pass table, because it is the
+  # answer to the question most readers open this with. Only worth printing
+  # with more than one pass: with a single pass every cell would be the same
+  # number three times, and `## fio results` below already is that table.
+  if [ "$REPEATS" -gt 1 ]; then
+    cat <<EOF
+## Aggregated results
+
+Every pass folded together: a table per mount and test, one row per metric,
+holding the median of the ${REPEATS} passes with the slowest and the fastest
+pass either side of it. The passes themselves are in
+[fio results](#fio-results); this is the same numbers with the arithmetic
+already done.
+
+Read the median as what to expect and the distance between min and max as how
+much the storage disagreed with itself from one pass to the next. A tight
+spread is a backend holding a service level. A wide one means the median is
+summarising passes that did not agree, and the pass-by-pass charts at the end
+of the report are where to see which pass was the odd one out — and whether it
+was the first, with a cold cache behind it, or one at random.
+
+The median is a median rather than a mean on purpose: a single stalled pass
+moves a mean without leaving anything behind that says it did, and moves a
+median hardly at all while showing up plainly in the min column.
+
+Bandwidth is MiB/s here rather than the KiB/s the CSVs and the table below use,
+because a seven-digit KiB/s figure is one nobody reads as a quantity. A
+direction a test never issued has no row rather than a row of zeros, so a write
+job gets three rows and \`rand_rw_70_30_4k\` six. Unless a table says otherwise
+above it, every one of the ${REPEATS} passes is in it; a test that lost passes
+to failures says how many it kept, and one that lost all of them says that
+instead of showing a table.
+
+EOF
+    fio_aggregate_table "$FIO_CSV"
+    echo
+  fi
 
   # ---- what each fio job actually ran ------------------------------------
   cat <<EOF
@@ -2398,12 +2553,13 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   #content { margin-left: 0; padding: 1.5rem 1.25rem 4rem; }
 }
 
-h1, h2, h3 { line-height: 1.25; font-weight: 600; }
+h1, h2, h3, h4 { line-height: 1.25; font-weight: 600; }
 h1 { font-size: 2rem; margin: 0 0 1.5rem; }
 h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; padding-bottom: 0.3rem;
      border-bottom: 1px solid var(--rule); }
 h3 { font-size: 1.15rem; margin: 2rem 0 0.75rem; }
-h2 .secnum, h3 .secnum { color: var(--muted); font-weight: 400; margin-right: 0.4rem; }
+h4 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+h2 .secnum, h3 .secnum, h4 .secnum { color: var(--muted); font-weight: 400; margin-right: 0.4rem; }
 
 a { color: var(--accent); }
 p, ul, ol { margin: 0 0 1rem; }
@@ -2467,24 +2623,32 @@ decorate() { # <base dir the markdown's graphs/... image paths are relative to>
 
     END {
       for (i = 1; i <= n; i++) {
-        if (line[i] !~ /^<h[23][^>]*>/) continue
+        if (line[i] !~ /^<h[234][^>]*>/) continue
         lvl = substr(line[i], 3, 1) + 0
         inner = line[i]
-        sub(/^<h[23][^>]*>/, "", inner)
-        sub(/<\/h[23]>[ \t]*$/, "", inner)
+        sub(/^<h[234][^>]*>/, "", inner)
+        sub(/<\/h[234]>[ \t]*$/, "", inner)
 
         base = slugify(inner)
         if (base == "") base = "section"
         if (base in seen) { id = base "-" seen[base]; seen[base]++ }
         else { id = base; seen[base] = 1 }
 
-        if (lvl == 2) { n2++; n3 = 0; num = n2 "." }
-        else { n3++; num = n2 "." n3 "." }
+        if (lvl == 2) { n2++; n3 = 0; n4 = 0; num = n2 "." }
+        else if (lvl == 3) { n3++; n4 = 0; num = n2 "." n3 "." }
+        else { n4++; num = n2 "." n3 "." n4 "." }
 
         hlvl[i] = lvl; hid[i] = id; hnum[i] = num; htxt[i] = inner
-        toc[++tn] = sprintf("<li class=\"toc-l%d\">" \
-          "<a href=\"#%s\"><span class=\"secnum\">%s</span>%s</a></li>",
-          lvl, id, num, inner)
+        # h4 is numbered and anchored like the rest — the slugs have to stay
+        # in step with the ones md_to_typst computes off the same headings, or
+        # the two documents disagree about which `#anchor` is which — but it
+        # stays out of the contents. The aggregated results alone are one h4
+        # per mount per test, and a contents list is not improved by carrying
+        # every one of them.
+        if (lvl <= 3)
+          toc[++tn] = sprintf("<li class=\"toc-l%d\">" \
+            "<a href=\"#%s\"><span class=\"secnum\">%s</span>%s</a></li>",
+            lvl, id, num, inner)
       }
 
       print "<nav id=\"toc\" aria-label=\"Contents\">"
