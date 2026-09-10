@@ -449,7 +449,15 @@ PG_DATADIRS=() # every cluster initdb created, across all mounts
 PG_ACTIVE=""   # the one with a postmaster currently up, if any
 PG_SOCKDIR=""
 
+# cleanup() runs from the EXIT trap and, on a signal, from on_signal() before
+# it re-raises. Both paths can be reached in one run, so it is written to be
+# safe to call twice rather than relying on only ever being called once.
+CLEANED=0
+
 cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+
   echo
   echo "Cleaning up test files..."
   for f in "${CREATED[@]:-}"; do [ -n "$f" ] && rm -f "$f"; done
@@ -474,7 +482,58 @@ cleanup() {
   done
   [ -n "$PG_SOCKDIR" ] && rm -rf "$PG_SOCKDIR"
 }
-trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Signals
+#
+# A trap handler for INT is not an exit. bash runs it and then *resumes the
+# script at the point the signal arrived*, so `trap cleanup EXIT INT TERM` —
+# which is what this was — meant Ctrl-C tore down the test files and then
+# carried on benchmarking on top of them, ran cleanup a second time from the
+# EXIT trap, and exited 0 as though the run had finished.
+#
+# So the signal paths are separated from the exit path. The handler cleans up
+# and then re-raises the signal against itself with the default disposition
+# restored, which is the only way to exit *as* killed: the caller sees 128+n
+# (130 for Ctrl-C) and a `while` loop or CI step around this script can tell an
+# interrupted run from a finished one. `exit 130` would report the number
+# without the process ever having died of the signal, which WIFSIGNALED-based
+# callers read as a normal exit.
+#
+# Every child this script starts runs in the foreground, so a terminal Ctrl-C
+# has already delivered SIGINT to fio or sleep as part of the same process
+# group by the time bash gets here; the postmaster is the exception, and
+# cleanup() stops it. A SIGTERM sent to this pid alone does not reach the
+# children, and bash will not run the trap until the current foreground child
+# returns — so a `kill` mid-fio takes effect when that fio finishes.
+#
+# The handler's own output goes to stderr, all of it, because of where a trap
+# can fire from: bash runs a handler between commands *inside* whatever was
+# running, redirections and all, and build_report() spends most of its time
+# inside `write_markdown >"$MD.part"`.
+# On stdout these lines would be appended to the half-written report instead of
+# being shown, which is how a SIGTERM during a report rebuild used to look like
+# no handler had run at all.
+# ---------------------------------------------------------------------------
+on_signal() { # <signal name>
+  {
+    echo
+    echo "Interrupted by SIG$1 — stopping."
+    # Said before cleanup, which prints its own progress and can take a moment
+    # when a postgres cluster has to come down.
+    [ -n "${OUTDIR:-}" ] && [ -d "${OUTDIR:-}" ] &&
+      echo "Partial results are in $OUTDIR"
+
+    cleanup
+  } >&2
+
+  trap - EXIT INT TERM
+  kill -"$1" $$
+}
+
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap cleanup EXIT
 
 log() { printf '\n=== %s ===\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
