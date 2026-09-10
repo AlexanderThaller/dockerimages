@@ -1080,6 +1080,16 @@ run_unit() { # <mount> <test>
 # statement. It is called from the bottom of the script instead, where
 # everything it reaches has been defined.
 run_passes() {
+  # bench_-prefixed loop variables, and local, on purpose. run_unit() rebuilds
+  # the whole report between tests, and bash has no lexical scope: an
+  # assignment inside build_report() to a name this loop is iterating with
+  # lands in *this* frame and silently redirects the run. That is exactly what
+  # `for mp in "${USABLE[@]}"` in write_markdown() used to do — the first test
+  # of a mount ran where it was told and the rest of that mount's tests ran on
+  # the last mount in USABLE instead. The names below are ones the report has
+  # no reason to use; the report's own loops are scoped as well, so both halves
+  # have to be got wrong before this can come back.
+  local bench_pass bench_mp bench_test first_mount first_test first_unit
   local unit_tests=${#TESTS[@]}
   [ "$have_pgbench" = 1 ] || unit_tests=$((unit_tests - 1))
   PROGRESS_TOTAL=$((REPEATS * ${#USABLE[@]} * unit_tests))
@@ -1100,51 +1110,51 @@ run_passes() {
     set_run_paths "$REPEATS"
     ELAPSED_LABEL="n/a (this report was rebuilt with --replot; see the original report for the real figure)"
   else
-    for pass in $(seq 1 "$REPEATS"); do
-      set_run_paths "$pass"
+    for bench_pass in $(seq 1 "$REPEATS"); do
+      set_run_paths "$bench_pass"
       RUN_IDS+=("$RUN_ID")
-      PROGRESS_PASS=$pass
+      PROGRESS_PASS=$bench_pass
 
       if [ "$REPEATS" -gt 1 ]; then
-        log "pass $pass of $REPEATS ($RUN_ID)"
+        log "pass $bench_pass of $REPEATS ($RUN_ID)"
         # The same cooldown that separates runs within a pass separates the
         # passes themselves, so pass 2 does not start measuring while the
         # backend is still flushing what pass 1 wrote.
-        [ "$pass" -gt 1 ] && settle
+        [ "$bench_pass" -gt 1 ] && settle
       fi
 
       if [ "$ORDER" = "by-mount" ]; then
         first_mount=1
-        for mp in "${USABLE[@]}"; do
+        for bench_mp in "${USABLE[@]}"; do
           [ $first_mount -eq 0 ] && {
             log "cooldown between mounts"
             settle
           }
           first_mount=0
-          log "$mp"
+          log "$bench_mp"
           first_test=1
-          for t in "${TESTS[@]}"; do
+          for bench_test in "${TESTS[@]}"; do
             # The gap between consecutive tests on one mount. Without it a test
             # begins while the previous one's writeback is still in flight, and
             # that shows up in its first samples as the storage being slower
             # than it is.
             [ $first_test -eq 0 ] && test_settle
             first_test=0
-            run_unit "$mp" "$t"
+            run_unit "$bench_mp" "$bench_test"
           done
         done
       else
         first_unit=1
-        for t in "${TESTS[@]}"; do
-          log "$t"
-          for mp in "${USABLE[@]}"; do
+        for bench_test in "${TESTS[@]}"; do
+          log "$bench_test"
+          for bench_mp in "${USABLE[@]}"; do
             # by-test already pauses between every (test, mount) unit, and
             # SETTLE is longer than TEST_SETTLE would be, so there is nothing to
             # add here.
             [ $first_unit -eq 0 ] && settle
             first_unit=0
-            info "-> $mp"
-            run_unit "$mp" "$t"
+            info "-> $bench_mp"
+            run_unit "$bench_mp" "$bench_test"
           done
         done
       fi
@@ -1602,6 +1612,13 @@ agg_graphed=0
 # rather than accumulated, so a chart that could not be drawn ten minutes ago
 # and can be drawn now moves the report with it.
 draw_graphs() {
+  # pgbench_graphed/cmp_graphed/agg_graphed and RENDER_AWK stay global — the
+  # report reads them after this returns. Everything else is scratch and is
+  # declared here: this function runs *inside* run_passes' loops now that
+  # reports are written between tests, and an undeclared `rid`/`t`/`passes`
+  # would be assigned in the caller's scope and move the benchmark's own
+  # iteration on to another pass or test. See the note in run_passes().
+  local rid t passes drawn
   pgbench_graphed=0
   cmp_graphed=0
   agg_graphed=0
@@ -2323,6 +2340,10 @@ emit_graphs() { # <graph basename> <caption subject> [pass id]
 # reader who has the HTML open while the benchmark rewrites it never sees half
 # a document.
 write_markdown() {
+  # Scoped for the same reason as draw_graphs(): this is called between tests,
+  # and `mp` in particular is the variable run_passes() is iterating mounts
+  # with while it calls us.
+  local mp sl t rid agg_csvs
   cat <<EOF
 # Storage Benchmark Report
 ${REPORT_BANNER}
