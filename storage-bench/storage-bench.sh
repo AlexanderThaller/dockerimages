@@ -71,7 +71,39 @@
 #   PGBENCH_MAX_WAL  postgres max_wal_size      (default 4GB)
 #   PLOT          1|0, draw the graphs          (default 1)
 #   RENDER        html|none, HTML and PDF       (default html)
+#   PROGRESSIVE   test|pass|none, rebuild the
+#                 report while the run is still
+#                 going                         (default test)
 #   ARCHIVE       1|0, tar.gz the run directory  (default 1)
+#
+# The report is not written only at the end. A full suite is hours of fio and
+# pgbench, and a report that appears when the last of it finishes is a report
+# nobody can act on while there is still time to change something. So the whole
+# reporting half of this script — reduce the logs, draw the charts, write the
+# Markdown, render the HTML — runs again after every test (PROGRESSIVE=test,
+# the default), or after every pass (PROGRESSIVE=pass), against whatever has
+# finished by then. The files are the same files, at the same paths, rewritten
+# in place; open storage-benchmark-report.html in a browser at the ten minute
+# mark and reload it as the run goes.
+#
+# Two things are deliberately left out of an in-progress rebuild: the PDF and
+# the archive. Both are the outputs nobody reads while a run is going — they
+# are what gets sent on and copied off afterwards — and typst's cost, unlike
+# everything else in here, grows with the size of the document rather than with
+# the number of measurements in it. They are made once, at the end. Everything
+# else is exactly what the final report will contain, so what is on screen when
+# a run ends is what was on screen a minute earlier, plus the last test.
+#
+# What a rebuild costs, measured on a finished three-pass, two-mount, eight-test
+# run: 2.5s to redraw every chart and 0.3s for the Markdown, the HTML and the
+# PDF together. It is awk over the fio logs almost end to end, and against a
+# 60s fio job it is a few percent of the run — which is what makes `test` an
+# affordable default rather than a mode to be opted into.
+#
+# A run that never reaches the end gets this for free. A pod evicted, a node
+# rebooted, a machine taken away at the two hour mark: what is left in the
+# results directory is a complete, rendered report of the first two hours,
+# where it used to be a directory of logs and a CSV.
 #
 # fio measures the storage directly. pgbench measures what a real application
 # gets out of it: a throwaway PostgreSQL cluster is initialised on each mount in
@@ -198,6 +230,19 @@ PGBENCH_MAX_WAL="${PGBENCH_MAX_WAL:-4GB}"
 PLOT="${PLOT:-1}"
 RENDER="${RENDER:-html}"
 
+# How often the report is rebuilt while the benchmark is still running. `test`
+# rebuilds after every (mount, test) unit, `pass` after every pass over the
+# suite, `none` only at the end — which is what this script did before.
+#
+# `test` is the default because it is the granularity that matches how a run is
+# watched: a fio job is a minute, a pgbench job several, and a rebuild is a few
+# seconds of awk and cmark-gfm against files that are already on disk. Paying
+# that after every test buys a report that is never more than one test out of
+# date. `pass` is for a run where even that is too much — a very short
+# FIO_RUNTIME, where the rebuild would be a real fraction of the work — and
+# `none` for a machine where the benchmark should have the CPU to itself.
+PROGRESSIVE="${PROGRESSIVE:-test}"
+
 # Tar the finished run directory up, so what has to be copied off the machine
 # that was measured is one file rather than a few thousand.
 ARCHIVE="${ARCHIVE:-1}"
@@ -253,6 +298,14 @@ case "$RENDER" in
 html | none) ;;
 *)
   echo "RENDER must be one of html|none (got '$RENDER')" >&2
+  exit 1
+  ;;
+esac
+
+case "$PROGRESSIVE" in
+test | pass | none) ;;
+*)
+  echo "PROGRESSIVE must be one of test|pass|none (got '$PROGRESSIVE')" >&2
   exit 1
   ;;
 esac
@@ -401,6 +454,13 @@ cleanup() {
   echo "Cleaning up test files..."
   for f in "${CREATED[@]:-}"; do [ -n "$f" ] && rm -f "$f"; done
 
+  # A report is written to <name>.part and renamed over the real file, so that
+  # nobody reading one mid-run sees half a document. A run that dies between
+  # the write and the rename leaves the .part behind, and the archive would
+  # otherwise carry a truncated copy of the report next to the good one.
+  rm -f "$OUTDIR/storage-benchmark-report.md.part" \
+    "$OUTDIR/storage-benchmark-report.html.part"
+
   if [ -n "$PG_ACTIVE" ]; then
     echo "Stopping postgres..."
     pg_ctl -D "$PG_ACTIVE" -m immediate -w stop >/dev/null 2>&1
@@ -418,6 +478,25 @@ trap cleanup EXIT INT TERM
 
 log() { printf '\n=== %s ===\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
+
+# Whether the report currently being built is the final one or an in-progress
+# rebuild. Read by rlog/rinfo below, and by the report itself, which says so at
+# the top when it is partial.
+REPORT_MODE=final
+
+# The reporting half of this script narrates itself — a line per chart, per
+# test, per pass — which is right once at the end of a run and wrong after
+# every test, where it would bury the benchmark's own output under the same
+# forty lines over and over. So everything under build_report() logs through
+# these, and a progressive rebuild says one line and nothing else.
+rlog() {
+  [ "$REPORT_MODE" = final ] && log "$@"
+  return 0
+}
+rinfo() {
+  [ "$REPORT_MODE" = final ] && info "$@"
+  return 0
+}
 
 slug() { echo "${1#/}" | tr '/' '_'; }
 
@@ -969,74 +1048,115 @@ START_EPOCH=$(date +%s)
 
 RUN_IDS=()
 
-if [ -n "$REPLOT_DIR" ]; then
-  # RUN_IDS the way every other pass-specific thing in this script is found:
-  # by the directory raw/<pass>/ that a real pass leaves behind, not by
-  # replaying REPEATS against fio and pgbench again.
-  readarray -t RUN_IDS < <(cd "$OUTDIR/raw" 2>/dev/null && ls -d run-* 2>/dev/null | sort)
-  if [ ${#RUN_IDS[@]} -eq 0 ]; then
-    echo "No raw/run-* directories under $OUTDIR. Nothing to replot." >&2
-    exit 1
-  fi
-  REPEATS=${#RUN_IDS[@]}
-  # Points RAWDIR/LOGDIR/PLOTDATA at the last pass, same as the last iteration
-  # of a real run would have left them — nothing after this point reads them
-  # for any pass but the last.
-  set_run_paths "$REPEATS"
-  ELAPSED_LABEL="n/a (this report was rebuilt with --replot; see the original report for the real figure)"
-else
-  for pass in $(seq 1 "$REPEATS"); do
-    set_run_paths "$pass"
-    RUN_IDS+=("$RUN_ID")
+# How far along the run is, for the banner an in-progress report carries at the
+# top of it. A reader who opens the HTML while the benchmark is still going has
+# to be told so in the report itself — the terminal it is running in is
+# somewhere else, and a partial report is otherwise indistinguishable from a
+# finished one that happens to be missing a mount.
+PROGRESS_DONE=0
+PROGRESS_TOTAL=0
+PROGRESS_NOW=""
+PROGRESS_PASS=0
 
-    if [ "$REPEATS" -gt 1 ]; then
-      log "pass $pass of $REPEATS ($RUN_ID)"
-      # The same cooldown that separates runs within a pass separates the
-      # passes themselves, so pass 2 does not start measuring while the
-      # backend is still flushing what pass 1 wrote.
-      [ "$pass" -gt 1 ] && settle
+# One (mount, test) unit, and the report rebuilt after it. Every path that runs
+# a test goes through here rather than calling run_test directly, so that the
+# two run orders cannot drift in what they count or in when they report.
+run_unit() { # <mount> <test>
+  # A pgbench that cannot run is not a unit: run_test returns immediately, and
+  # counting it would have the progress line claim work that never happened.
+  [ "$2" = pgbench ] && [ "$have_pgbench" != 1 ] && return 0
+
+  PROGRESS_NOW="$2 on $1"
+  run_test "$1" "$2"
+  PROGRESS_DONE=$((PROGRESS_DONE + 1))
+  progress_report test
+}
+
+# The benchmark itself: REPEATS passes over the suite, in ORDER.
+#
+# A function rather than the top-level block it used to be, because it now
+# calls build_report() between tests and a function that is defined further
+# down the file does not exist yet at the point bash reads a top-level
+# statement. It is called from the bottom of the script instead, where
+# everything it reaches has been defined.
+run_passes() {
+  local unit_tests=${#TESTS[@]}
+  [ "$have_pgbench" = 1 ] || unit_tests=$((unit_tests - 1))
+  PROGRESS_TOTAL=$((REPEATS * ${#USABLE[@]} * unit_tests))
+
+  if [ -n "$REPLOT_DIR" ]; then
+    # RUN_IDS the way every other pass-specific thing in this script is found:
+    # by the directory raw/<pass>/ that a real pass leaves behind, not by
+    # replaying REPEATS against fio and pgbench again.
+    readarray -t RUN_IDS < <(cd "$OUTDIR/raw" 2>/dev/null && ls -d run-* 2>/dev/null | sort)
+    if [ ${#RUN_IDS[@]} -eq 0 ]; then
+      echo "No raw/run-* directories under $OUTDIR. Nothing to replot." >&2
+      exit 1
     fi
+    REPEATS=${#RUN_IDS[@]}
+    # Points RAWDIR/LOGDIR/PLOTDATA at the last pass, same as the last iteration
+    # of a real run would have left them — nothing after this point reads them
+    # for any pass but the last.
+    set_run_paths "$REPEATS"
+    ELAPSED_LABEL="n/a (this report was rebuilt with --replot; see the original report for the real figure)"
+  else
+    for pass in $(seq 1 "$REPEATS"); do
+      set_run_paths "$pass"
+      RUN_IDS+=("$RUN_ID")
+      PROGRESS_PASS=$pass
 
-    if [ "$ORDER" = "by-mount" ]; then
-      first_mount=1
-      for mp in "${USABLE[@]}"; do
-        [ $first_mount -eq 0 ] && {
-          log "cooldown between mounts"
-          settle
-        }
-        first_mount=0
-        log "$mp"
-        first_test=1
-        for t in "${TESTS[@]}"; do
-          # The gap between consecutive tests on one mount. Without it a test
-          # begins while the previous one's writeback is still in flight, and
-          # that shows up in its first samples as the storage being slower
-          # than it is.
-          [ $first_test -eq 0 ] && test_settle
-          first_test=0
-          run_test "$mp" "$t"
-        done
-      done
-    else
-      first_unit=1
-      for t in "${TESTS[@]}"; do
-        log "$t"
+      if [ "$REPEATS" -gt 1 ]; then
+        log "pass $pass of $REPEATS ($RUN_ID)"
+        # The same cooldown that separates runs within a pass separates the
+        # passes themselves, so pass 2 does not start measuring while the
+        # backend is still flushing what pass 1 wrote.
+        [ "$pass" -gt 1 ] && settle
+      fi
+
+      if [ "$ORDER" = "by-mount" ]; then
+        first_mount=1
         for mp in "${USABLE[@]}"; do
-          # by-test already pauses between every (test, mount) unit, and
-          # SETTLE is longer than TEST_SETTLE would be, so there is nothing to
-          # add here.
-          [ $first_unit -eq 0 ] && settle
-          first_unit=0
-          info "-> $mp"
-          run_test "$mp" "$t"
+          [ $first_mount -eq 0 ] && {
+            log "cooldown between mounts"
+            settle
+          }
+          first_mount=0
+          log "$mp"
+          first_test=1
+          for t in "${TESTS[@]}"; do
+            # The gap between consecutive tests on one mount. Without it a test
+            # begins while the previous one's writeback is still in flight, and
+            # that shows up in its first samples as the storage being slower
+            # than it is.
+            [ $first_test -eq 0 ] && test_settle
+            first_test=0
+            run_unit "$mp" "$t"
+          done
         done
-      done
-    fi
-  done
-fi
+      else
+        first_unit=1
+        for t in "${TESTS[@]}"; do
+          log "$t"
+          for mp in "${USABLE[@]}"; do
+            # by-test already pauses between every (test, mount) unit, and
+            # SETTLE is longer than TEST_SETTLE would be, so there is nothing to
+            # add here.
+            [ $first_unit -eq 0 ] && settle
+            first_unit=0
+            info "-> $mp"
+            run_unit "$mp" "$t"
+          done
+        done
+      fi
 
-ELAPSED=$(($(date +%s) - START_EPOCH))
-[ -n "$REPLOT_DIR" ] || ELAPSED_LABEL="${ELAPSED}s"
+      # The end of a pass, which is the other granularity a report can be
+      # rebuilt at. With PROGRESSIVE=test one was written a moment ago, after
+      # this pass's last test, and progress_report() knows not to write it
+      # twice.
+      progress_report pass
+    done
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Graphs
@@ -1470,8 +1590,24 @@ pgbench_graphed=0
 cmp_graphed=0
 agg_graphed=0
 
-if [ "$have_plot" = 1 ]; then
-  log "Drawing graphs"
+# Every chart the report embeds, drawn from the fio and pgbench logs the passes
+# have left behind so far.
+#
+# "so far" is the whole of what makes this a function rather than the top-level
+# block it used to be: it runs again after every test while the benchmark is
+# still going, so it has to be safe over a half-finished run. It is, and for a
+# reason that predates progressive reporting — a pass with no samples yet is
+# indistinguishable from a test whose fio job failed, which this already had to
+# handle. The three *_graphed flags are recomputed from scratch on every call
+# rather than accumulated, so a chart that could not be drawn ten minutes ago
+# and can be drawn now moves the report with it.
+draw_graphs() {
+  pgbench_graphed=0
+  cmp_graphed=0
+  agg_graphed=0
+  [ "$have_plot" = 1 ] || return 0
+
+  rlog "Drawing graphs"
 
   # Materialised once per run rather than shipped as its own file: the image
   # is deliberately one script (see default.nix), and this keeps it that way
@@ -1813,7 +1949,7 @@ AWKEOF
 
   for rid in "${passes[@]}"; do
     [ "$REPEATS" -gt 1 ] && {
-      if [ "$rid" = agg ]; then info "aggregate:"; else info "$rid:"; fi
+      if [ "$rid" = agg ]; then rinfo "aggregate:"; else rinfo "$rid:"; fi
     }
     for t in "${FIO_TESTS[@]}"; do
       drawn=0
@@ -1824,7 +1960,7 @@ AWKEOF
         "Bandwidth over time" 0 && drawn=1
       plot_metric "$rid" "$t" _clat.log clat avg 0.001 "completion latency (us)" \
         "Completion latency over time" 1 && drawn=1
-      if [ $drawn -eq 1 ]; then info "  $t"; else info "  $t — no samples, skipped"; fi
+      if [ $drawn -eq 1 ]; then rinfo "  $t"; else rinfo "  $t — no samples, skipped"; fi
       [ "$rid" = agg ] && [ $drawn -eq 1 ] && agg_graphed=1
     done
 
@@ -1840,12 +1976,12 @@ AWKEOF
       "Worst transaction latency over time" 1 && drawn=1
     [ $drawn -eq 1 ] && pgbench_graphed=1
     [ "$rid" = agg ] && [ $drawn -eq 1 ] && agg_graphed=1
-    if [ $drawn -eq 1 ]; then info "  pgbench"; else info "  pgbench — no samples, skipped"; fi
+    if [ $drawn -eq 1 ]; then rinfo "  pgbench"; else rinfo "  pgbench — no samples, skipped"; fi
   done
 
   # Last, because it reads what every pass above wrote.
   if [ "$REPEATS" -gt 1 ]; then
-    info "every pass on one axis:"
+    rinfo "every pass on one axis:"
     for t in "${FIO_TESTS[@]}"; do
       drawn=0
       plot_compare "$t" iops "IOPS" "IOPS over time" 0 && drawn=1
@@ -1853,7 +1989,7 @@ AWKEOF
       plot_compare "$t" clat "completion latency (us)" \
         "Completion latency over time" 1 && drawn=1
       [ $drawn -eq 1 ] && cmp_graphed=1
-      if [ $drawn -eq 1 ]; then info "  $t"; else info "  $t — no samples, skipped"; fi
+      if [ $drawn -eq 1 ]; then rinfo "  $t"; else rinfo "  $t — no samples, skipped"; fi
     done
 
     if [ "$have_pgbench" = 1 ]; then
@@ -1864,10 +2000,10 @@ AWKEOF
       plot_compare pgbench maxlat "worst latency (ms)" \
         "Worst transaction latency over time" 1 && drawn=1
       [ $drawn -eq 1 ] && cmp_graphed=1
-      if [ $drawn -eq 1 ]; then info "  pgbench"; else info "  pgbench — no samples, skipped"; fi
+      if [ $drawn -eq 1 ]; then rinfo "  pgbench"; else rinfo "  pgbench — no samples, skipped"; fi
     fi
   fi
-fi
+}
 
 # ---------------------------------------------------------------------------
 # Markdown report
@@ -2089,10 +2225,18 @@ has_graphs() { # <pass id>
   done
   return 1
 }
-if [ "$REPEATS" -gt 1 ] && [ "$agg_graphed" = 1 ]; then
-  HEADLINE_GRAPHS="aggregate"
-  HEADLINE_SUFFIX=" (mean of $REPEATS passes)"
-  HEADLINE_GRAPH_NOTE="
+# Recomputed on every build, not once: which charts are the headline depends on
+# what has been drawn, and over a run that is still going that answer changes —
+# the first pass is the headline until there is a second one to aggregate with.
+set_headline_graphs() {
+  HEADLINE_GRAPHS=""
+  HEADLINE_SUFFIX=""
+  HEADLINE_GRAPH_NOTE=""
+
+  if [ "$REPEATS" -gt 1 ] && [ "$agg_graphed" = 1 ]; then
+    HEADLINE_GRAPHS="aggregate"
+    HEADLINE_SUFFIX=" (mean of $REPEATS passes)"
+    HEADLINE_GRAPH_NOTE="
 The suite ran ${REPEATS} times. Each chart below is the mean across those passes,
 with the band behind it spanning the slowest and fastest pass at that moment —
 so the line is what to expect and the width of the band is how much the storage
@@ -2100,9 +2244,53 @@ disagreed with itself. A band that stays narrow is a backend under control; one
 that flares is a backend whose behaviour depends on something not being
 measured here. The passes are also plotted separately in
 [pass by pass](#pass-by-pass)."
-elif [ ${#RUN_IDS[@]} -gt 0 ] && has_graphs "${RUN_IDS[0]}"; then
-  HEADLINE_GRAPHS="${RUN_IDS[0]}"
-fi
+  elif [ ${#RUN_IDS[@]} -gt 0 ] && has_graphs "${RUN_IDS[0]}"; then
+    HEADLINE_GRAPHS="${RUN_IDS[0]}"
+  fi
+}
+
+# What a report of a run that has not finished says about itself, and what the
+# same report says when the run has. Both are set on every build rather than
+# once, because the last build has to come out with none of the first in it.
+REPORT_BANNER=""
+GENERATED_SUFFIX=""
+AGG_PARTIAL_NOTE=""
+
+set_report_status() {
+  REPORT_BANNER=""
+  AGG_PARTIAL_NOTE=""
+  GENERATED_SUFFIX=""
+  [ -n "$REPLOT_DIR" ] && GENERATED_SUFFIX=" (--replot)"
+  [ "$REPORT_MODE" = final ] && return 0
+
+  GENERATED_SUFFIX=" — partial, the run was still going"
+
+  # First thing in the document, before the property table, because everything
+  # under it is provisional and a reader who scrolls past this has been misled
+  # by a report that otherwise looks exactly like a finished one.
+  REPORT_BANNER="
+> **This run has not finished.** ${PROGRESS_DONE} of ${PROGRESS_TOTAL} test runs are done —
+> pass ${PROGRESS_PASS} of ${REPEATS}, most recently \`${PROGRESS_NOW}\`. Every table,
+> chart and average below covers those and no more: a mount or a test whose turn
+> has not come yet is absent from the tables rather than sitting in them with
+> nothing under it, and the aggregate is over the passes that have finished
+> rather than all ${REPEATS}.
+>
+> This file is rewritten after every test until the run ends, at which point it
+> is replaced by the finished report and this note goes away. The PDF is
+> compiled once, at the end, so there may not be one next to this yet.
+"
+
+  # Leading and trailing newline, like REPORT_BANNER above: both are
+  # substituted into the Markdown on a line of their own, so an empty one has
+  # to collapse to exactly the blank line that separates the paragraphs it sits
+  # between, and a set one has to keep that blank line either side of itself.
+  AGG_PARTIAL_NOTE="
+**The run is still going**, so this section folds together only the passes that
+have finished — read the pass count in the note above each table, not the
+${REPEATS} this run was asked for.
+"
+}
 
 # The three charts for one test, if they were drawn. The alt text doubles as the
 # caption: render_html lifts a paragraph that holds nothing but an image into a
@@ -2130,15 +2318,17 @@ emit_graphs() { # <graph basename> <caption subject> [pass id]
   done
 }
 
-log "Writing report"
-
-{
+# The report itself, on stdout. The caller redirects it — a build writes it to a
+# temporary file beside the real one and renames it into place, so that a
+# reader who has the HTML open while the benchmark rewrites it never sees half
+# a document.
+write_markdown() {
   cat <<EOF
 # Storage Benchmark Report
-
+${REPORT_BANNER}
 | Property | Value |
 | -------- | ----- |
-| Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC')$([ -n "$REPLOT_DIR" ] && echo " (--replot)") |
+| Generated         | $(date -u '+%Y-%m-%d %H:%M:%S UTC')${GENERATED_SUFFIX} |
 | Label             | ${LABEL:-n/a} |
 | Total runtime     | ${ELAPSED_LABEL} |
 | Host / pod        | $(uname -n) |
@@ -2211,7 +2401,7 @@ spread is a backend holding a service level. A wide one means the median is
 summarising passes that did not agree, and the pass-by-pass charts at the end
 of the report are where to see which pass was the odd one out — and whether it
 was the first, with a cold cache behind it, or one at random.
-
+${AGG_PARTIAL_NOTE}
 The median is a median rather than a mean on purpose: a single stalled pass
 moves a mean without leaving anything behind that says it did, and moves a
 median hardly at all while showing up plainly in the min column.
@@ -2546,7 +2736,7 @@ when the machine that ran the benchmark did not:
 Editing it is also the way to change how a page is laid out — margins, the
 point at which a wide table is turned sideways — without rerunning anything.
 MDEOF
-} >"$MD"
+}
 
 # ---------------------------------------------------------------------------
 # Render
@@ -3111,19 +3301,42 @@ HTML=""
 PDF=""
 TYP=""
 
-if [ "$RENDER" = "html" ]; then
-  log "Rendering report"
+render_report() {
+  # Reset rather than accumulated: these name what *this* build produced, and
+  # the final summary prints them. A rebuild whose HTML failed after an earlier
+  # one succeeded must not still be claiming the file it did not write.
+  HTML=""
+  PDF=""
+  TYP=""
+
+  [ "$RENDER" = "html" ] || return 0
+
+  rlog "Rendering report"
 
   if [ "$have_html" = 1 ]; then
-    info "HTML ..."
+    rinfo "HTML ..."
     html_out="$OUTDIR/storage-benchmark-report.html"
-    if render_html "$MD" "$html_out" 2>"$RAWDIR/render.log" &&
-      [ -s "$html_out" ]; then
+    # Rendered to a file beside the real one and renamed over it. The rename is
+    # atomic, and this file is now rewritten every couple of minutes underneath
+    # whoever has it open — a browser that reloaded halfway through a write
+    # would otherwise show half a document and, worse, look like the benchmark
+    # had produced one.
+    if render_html "$MD" "$html_out.part" 2>"$RAWDIR/render.log" &&
+      [ -s "$html_out.part" ]; then
+      mv -f "$html_out.part" "$html_out"
       HTML="$html_out"
     else
-      info "  FAILED (see $RAWDIR/render.log)"
+      rm -f "$html_out.part"
+      rinfo "  FAILED (see $RAWDIR/render.log)"
     fi
   fi
+
+  # Where an in-progress rebuild stops. The PDF is the copy that gets sent on
+  # after a run, not the one anyone watches it through, and typst's cost is the
+  # only one here that scales with the document rather than with the
+  # measurements in it. It is compiled once, when the run is over and the
+  # numbers are final.
+  [ "$REPORT_MODE" = final ] || return 0
 
   # The typst source is written whether or not there is a typst to compile it,
   # the same way the Markdown is written whether or not there is a cmark-gfm:
@@ -3148,7 +3361,77 @@ if [ "$RENDER" = "html" ]; then
     rm -f "$pdf_out"
     info "  FAILED (see $RAWDIR/render.log)"
   fi
-fi
+}
+
+# ---------------------------------------------------------------------------
+# Build the report
+#
+# Everything downstream of the measurements, in one call: reduce the logs, draw
+# the charts, write the Markdown, render it. It is the last thing a run does,
+# and — with PROGRESSIVE set to anything but none — also the thing it does
+# after every test on the way there, over whatever has finished by then.
+#
+# Nothing in here reads the benchmark's state except through the files on disk
+# and the handful of globals the passes maintain (RUN_IDS, FIO_ARGS, the CSVs),
+# which is what makes calling it thirty times as safe as calling it once. It is
+# also what --replot has always relied on, and progressive reporting is really
+# just --replot against a run that is still going.
+# ---------------------------------------------------------------------------
+build_report() { # <final|progressive>
+  REPORT_MODE="${1:-final}"
+
+  ELAPSED=$(($(date +%s) - START_EPOCH))
+  if [ -n "$REPLOT_DIR" ]; then
+    : # ELAPSED_LABEL is the --replot sentence run_passes set; leave it alone.
+  elif [ "$REPORT_MODE" = final ]; then
+    ELAPSED_LABEL="${ELAPSED}s"
+  else
+    ELAPSED_LABEL="${ELAPSED}s so far"
+  fi
+
+  draw_graphs
+  set_headline_graphs
+  set_report_status
+
+  rlog "Writing report"
+
+  # Same rename as the HTML below, for the same reason, and it matters more
+  # here: the Markdown is what render_html and render_typst read, so a reader
+  # is not the only one who can catch this file half-written.
+  if write_markdown >"$MD.part"; then
+    mv -f "$MD.part" "$MD"
+  else
+    rm -f "$MD.part"
+    return 1
+  fi
+
+  render_report
+
+  # One line, in place of the forty rlog/rinfo has just swallowed — enough to
+  # see in the scrollback that the report on disk has moved, and where it is.
+  [ "$REPORT_MODE" = final ] ||
+    info "report updated (${PROGRESS_DONE}/${PROGRESS_TOTAL}): ${HTML:-$MD}"
+}
+
+# The hook run_unit and run_passes call. The argument is the granularity of the
+# call site, and the rebuild happens only when it is the granularity asked for
+# — so with PROGRESSIVE=test the call at the end of a pass does nothing, the
+# call after that pass's last test having just written the same report.
+progress_report() { # <test|pass>
+  [ "$PROGRESSIVE" = "$1" ] || return 0
+  build_report progressive
+}
+
+# ---------------------------------------------------------------------------
+# Run
+#
+# The first two statements in this script that measure or report anything.
+# Everything above is a definition or a check, which is what lets run_passes()
+# call build_report() between tests: bash reads a script from the top, and a
+# function is only callable once its definition has been read.
+# ---------------------------------------------------------------------------
+run_passes
+build_report final
 
 # ---------------------------------------------------------------------------
 # Archive

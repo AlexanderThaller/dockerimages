@@ -109,6 +109,21 @@
 # Holding the pod open for an hour after the run is what makes the report
 # reachable; deploy/job.yaml sets it, and a run on a laptop wants it at 0.
 #
+# The report is not written only at the end. A run of a hundred kills paced a
+# minute apart is most of two hours, and a timeline that appears when the last
+# pod comes back is one nobody can hold against a benchmark that is still
+# running. So the charts and the report are rebuilt after every round, over the
+# events recorded so far, and rewritten in place: open report.html after the
+# first kill and reload it as the run goes. PROGRESSIVE=none restores the
+# write-once behaviour. The PDF is left to the end: it is the copy that gets
+# sent on afterwards rather than the one anyone watches a run through, and
+# typst's cost is the only one here that grows with the document rather than
+# with the number of kills in it.
+#
+# A run that never reaches its own end gets this for free — a Job evicted, a
+# token expired, a cluster taken away — where it used to leave events.csv and
+# nothing rendered.
+#
 # KILL_MODE=force is `kubectl delete --force --grace-period=0`: the API object
 # goes immediately and the kubelet is told to stop the container afterwards,
 # which is as close to pulling the plug as an API call gets and is what makes
@@ -172,6 +187,7 @@ TUNABLE_SPEC=(
   "MIN_READY|0|ready pods a group must be left with"
   "DRY_RUN|0|1|0, resolve and report, delete nothing"
   "REPORT|html|html and pdf, md or none"
+  "PROGRESSIVE|round|round or none: rebuild the report as the run goes"
   "HOLD|0|seconds to stay alive after the report"
   "KUBECTL|kubectl|client to use; may carry flags"
 )
@@ -259,6 +275,12 @@ Output — one directory per run, under OUTBASE:
   histogram.svg distribution of recovery times, overall and per component
   timeline.svg  one lane per component, kills and recoveries along time
   report.html   all of the above, rendered — this is the one to read
+
+  The report is rewritten after every round, over the kills recorded so far, so
+  report.html is readable from the first round onwards rather than only when the
+  run ends — it says in a banner at the top how far along the run was when it
+  was written. PROGRESSIVE=none keeps it to the end. The PDF is compiled once,
+  when the run is over.
 
 Replotting:
   storage-chaos.sh --replot <dir>
@@ -377,6 +399,14 @@ init_config() {
     ;;
   esac
 
+  case "$PROGRESSIVE" in
+  round | none) ;;
+  *)
+    echo "PROGRESSIVE must be 'round' or 'none' (got '$PROGRESSIVE')" >&2
+    exit 1
+    ;;
+  esac
+
   # Every numeric tunable ends up in arithmetic or in `sleep`, and a typo in one
   # is otherwise found halfway into a run, as a shell error inside a loop that
   # then carries on with the empty string.
@@ -487,6 +517,24 @@ elapsed() { # <epoch ns>
 log() { printf '\n=== %s ===\n' "$*" | tee -a "$LOGFILE"; }
 info() { printf '  %s\n' "$*" | tee -a "$LOGFILE"; }
 warn() { printf '  ! %s\n' "$*" | tee -a "$LOGFILE" >&2; }
+
+# Whether the report being written is the final one or an in-progress rebuild.
+# Read by rinfo/rwarn below and by report_md, which says so at the top of a
+# report of a run that has not finished.
+REPORT_MODE=final
+
+# write_report() narrates itself, a line per file it writes, which is right
+# once at the end of a run and wrong after every round — with INTERVAL=0 and a
+# hundred rounds it would be most of chaos.log. So everything under
+# write_report() logs through these, and a progressive rebuild says one line.
+rinfo() {
+  [ "$REPORT_MODE" = final ] && info "$@"
+  return 0
+}
+rwarn() {
+  [ "$REPORT_MODE" = final ] && warn "$@"
+  return 0
+}
 
 # The machine-readable half of the output, and the only input the report reads.
 # Anything worth putting in the timeline goes through here.
@@ -1401,13 +1449,37 @@ histogram_svg() { # <pairs>
 # The Markdown half of the report. Everything in it comes out of events.csv, so
 # a run that was interrupted still reports what it managed to do.
 report_md() { # <events.csv> <end iso> <span seconds>
+  # What a report of a run that has not finished says about itself. The banner
+  # goes first, before the settings table, because everything under it is
+  # provisional and a reader who scrolls past it has been misled by a document
+  # that otherwise looks exactly like a finished one.
+  #
+  # It substitutes onto a line of its own, so the empty case has to collapse to
+  # exactly the blank line that separates the title from the table, and the set
+  # case has to keep that blank line either side of itself — hence the leading
+  # and trailing newline.
+  local banner="" ended="Ended"
+  if [ "$REPORT_MODE" != final ]; then
+    ended="Written at"
+    banner="
+> **This run has not finished.** It is $ROUND round$([ "$ROUND" = 1 ] || echo s) in, and the tables and
+> charts below cover only what has happened so far. This file is rewritten after
+> every round until the run ends, at which point the finished report replaces it
+> and this note goes away.
+>
+> The charts are drawn against the time elapsed so far, so their axes grow with
+> each rebuild, and the PDF is compiled once, at the end — there may not be one
+> next to this yet.
+"
+  fi
+
   cat <<MDEOF
 # Storage chaos run
-
+${banner}
 | setting | value |
 |---|---|
 | Started | \`$START_ISO\` (epoch ns \`$START_NS\`) |
-| Ended | \`$2\` |
+| $ended | \`$2\` |
 | Duration | ${3}s |
 | Namespaces | \`${NAMESPACES[*]}\` |
 | Label | ${LABEL:+\`$LABEL\`}$([ -z "$LABEL" ] && echo "n/a") |
@@ -1950,19 +2022,36 @@ HEADEOF
 }
 
 # Draws the four charts and writes report.md (and report.html, if REPORT is
-# html) from a run's events.csv — shared by finish() and --replot, so a live
-# run and a replotted one can never draw a chart differently. Reads $KILLS
-# and $OUTDIR/$TMP as set by the caller, same as report_md and the *_svg
-# functions already did before this was split out.
-write_report() { # <events.csv> <end iso> <span seconds>
-  local events="$1" end_iso="$2" span="$3" TIMELINE_NOTE=""
+# html) from the events recorded so far — shared by finish(), --replot and the
+# progressive rebuild, so a live run, a replotted one and a run still going can
+# never draw a chart differently. Reads $KILLS and $OUTDIR/$TMP as set by the
+# caller, same as report_md and the *_svg functions already did before this was
+# split out.
+#
+# "so far" is what the fourth argument is about: this is called after every
+# round while the run is still going (PROGRESSIVE=round, the default) as well
+# as at the end, so that a run of a hundred kills does not keep its report to
+# itself for the hour it takes. Nothing in here reads the live state except
+# events.csv and the counters, which is what makes calling it fifty times as
+# safe as calling it once — it is the same job --replot does from the events
+# file alone, against a run that happens to still be going.
+#
+# Every file is written into TMP and renamed over the real one. The rename is
+# atomic, so a browser reloading report.html between rounds never catches a
+# half-written document, and neither does a `kubectl cp` of the directory.
+write_report() { # <events.csv> <end iso> <span seconds> [final|progressive]
+  local events="$1" end_iso="$2" span="$3" TIMELINE_NOTE="" f
+  REPORT_MODE="${4:-final}"
 
   # Paired once; all three charts read it.
   pair_kills "$events" "$span" >"$TMP/pairs"
-  timeline_svg "$TMP/pairs" "$span" >"$OUTDIR/timeline.svg"
-  heatmap_svg "$TMP/pairs" "$span" >"$OUTDIR/heatmap.svg"
-  recovery_svg "$TMP/pairs" "$span" >"$OUTDIR/recovery.svg"
-  histogram_svg "$TMP/pairs" >"$OUTDIR/histogram.svg"
+  timeline_svg "$TMP/pairs" "$span" >"$TMP/timeline.svg"
+  heatmap_svg "$TMP/pairs" "$span" >"$TMP/heatmap.svg"
+  recovery_svg "$TMP/pairs" "$span" >"$TMP/recovery.svg"
+  histogram_svg "$TMP/pairs" >"$TMP/histogram.svg"
+  for f in timeline heatmap recovery histogram; do
+    mv -f "$TMP/$f.svg" "$OUTDIR/$f.svg"
+  done
 
   # The timeline stops being readable somewhere around fifty kills — the marks
   # merge and the bars go sub-pixel. It is still drawn, because nothing else
@@ -1976,16 +2065,25 @@ long. This one is kept for the hover text, which still names every pod.
 "
   fi
 
-  report_md "$events" "$end_iso" "$span" >"$OUTDIR/report.md"
-  info "report: $OUTDIR/report.md"
+  report_md "$events" "$end_iso" "$span" >"$TMP/report.md" &&
+    mv -f "$TMP/report.md" "$OUTDIR/report.md"
+  rinfo "report: $OUTDIR/report.md"
 
   if [ "$REPORT" = html ]; then
     if command -v cmark-gfm >/dev/null 2>&1; then
-      render_html "$OUTDIR/report.md" "$OUTDIR/report.html" "$OUTDIR"
-      info "report: $OUTDIR/report.html"
+      render_html "$OUTDIR/report.md" "$TMP/report.html" "$OUTDIR" &&
+        mv -f "$TMP/report.html" "$OUTDIR/report.html"
+      rinfo "report: $OUTDIR/report.html"
     else
-      warn "cmark-gfm not on PATH — the report stays as Markdown"
+      rwarn "cmark-gfm not on PATH — the report stays as Markdown"
     fi
+
+    # Where an in-progress rebuild stops. The PDF is what gets sent on after a
+    # run rather than what anyone watches it through, and typst lays the whole
+    # document out again from scratch every time — the one cost here that grows
+    # with the document rather than with the number of kills in it. It is
+    # compiled once, at the end, when the numbers are final.
+    [ "$REPORT_MODE" = final ] || return 0
 
     # The typst source is written whether or not there is a typst to compile
     # it, the same way the Markdown is written whether or not there is a
@@ -2011,6 +2109,25 @@ long. This one is kept for the hover text, which still names every pod.
       warn "typst not on PATH — no PDF; report.typ is what compiles it elsewhere"
     fi
   fi
+
+}
+
+# The hook run_loop calls at the end of every round. The one line it prints is
+# in place of the four write_report() has just swallowed — enough to see in
+# chaos.log that the report on disk has moved, and where it is. It names the
+# HTML when there is one and the Markdown otherwise, rather than promising a
+# file that REPORT=md or a missing cmark-gfm never wrote.
+progress_report() {
+  local shown
+  [ "$PROGRESSIVE" = round ] || return 0
+  [ "$REPORT" = none ] && return 0
+
+  now
+  write_report "$EVENTS" "$NOW_ISO" "$(((NOW_NS - START_NS) / 1000000000))" progressive
+
+  shown="$OUTDIR/report.md"
+  [ -s "$OUTDIR/report.html" ] && shown="$OUTDIR/report.html"
+  info "report updated after round $ROUND: $shown"
 }
 
 finish() {
@@ -2025,7 +2142,7 @@ finish() {
   info "$([ "$DRY_RUN" -eq 1 ] && echo "would have killed" || echo "killed") $KILLS, skipped $SKIPS, failed $FAILURES, over ${span}s"
   info "events: $EVENTS"
 
-  [ "$REPORT" = none ] || write_report "$EVENTS" "$end_iso" "$span"
+  [ "$REPORT" = none ] || write_report "$EVENTS" "$end_iso" "$span" final
 
   if [ "$HOLD" -gt 0 ]; then
     info "holding the container open for ${HOLD}s so the report can be copied out"
@@ -2209,6 +2326,11 @@ run_loop() {
       riso="$NOW_ISO" rns="$NOW_NS"
       event "$riso" "$rns" "$ROUND" round-end "" "" "" "" "" "killed=$KILLS skipped=$SKIPS"
 
+      # Before the interval rather than after it: the round's own kills and
+      # recoveries are what the rebuild is for, and the pause that follows is
+      # exactly when someone is looking at the report.
+      progress_report
+
       over_budget && break
       [ "$INTERVAL" -gt 0 ] && nap "$INTERVAL"
     done
@@ -2267,6 +2389,29 @@ init_replot() { # <dir>
     set +a
   fi
   for v in "${!_explicit[@]}"; do declare -g "$v=${_explicit[$v]}"; done
+
+  # A tunable this version of the script has and the run being replotted did
+  # not is still unset at this point: config.env cannot carry a variable that
+  # did not exist when it was written, and neither can a run whose config.env
+  # is missing altogether, which this is documented to tolerate. `${!v}` under
+  # `set -u` aborts on one of those rather than defaulting — config_lines() and
+  # the report's configuration table walk every tunable there is — so the same
+  # defaults init_config applies are applied here, for the same reason: an old
+  # run replotted by a newer script should read as that script's defaults, not
+  # fail outright.
+  #
+  # OUTBASE and RUNDIR come from the directory that was actually given rather
+  # than from the spec, whose entries for those two are placeholders describing
+  # how init_config computes them.
+  for _spec in "${TUNABLE_SPEC[@]}"; do
+    spec_parts "$_spec"
+    case "$SPEC_NAME" in
+    OUTBASE) [ -n "${OUTBASE:-}" ] || OUTBASE="$(dirname "$OUTDIR")" ;;
+    RUNDIR) [ -n "${RUNDIR+x}" ] || RUNDIR="$(basename "$OUTDIR")" ;;
+    *) [ -n "${!SPEC_NAME:-}" ] || declare -g "$SPEC_NAME=$SPEC_DEF" ;;
+    esac
+  done
+  unset _spec
 
   case "$REPORT" in
   html | md | none) ;;

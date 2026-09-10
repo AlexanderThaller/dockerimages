@@ -139,6 +139,32 @@ the uid has no `/etc/passwd` entry and one cannot be added.
 | --- | --- | --- |
 | `PLOT` | `1` | `0` skips the graphs. The report says so, and the raw time-series logs are still written. |
 | `RENDER` | `html` | Renders the report as both HTML and PDF; `none` writes only the Markdown. The HTML is a single self-contained file with the graphs inlined; the PDF is typeset by `typst`, which reads the same SVGs directly. |
+| `PROGRESSIVE` | `test` | Rebuild the report while the run is still going: after every test (`test`), after every pass over the suite (`pass`), or only at the end (`none`). |
+
+A full suite is hours of fio and pgbench, and a report that appears when the
+last of it finishes is a report nobody can act on while there is still time to
+change something. So the whole reporting half of the script — reduce the logs,
+draw the charts, write the Markdown, render the HTML — runs again after every
+test, against whatever has finished by then, rewriting the same files at the
+same paths. Open `storage-benchmark-report.html` ten minutes in and reload it as
+the run goes; a report of a run still in progress says so in a banner at the
+top of it, and says how far along it is.
+
+Two things are left out of an in-progress rebuild: the PDF and the archive.
+Both are the outputs nobody reads while a run is going — they are what gets
+sent on and copied off afterwards — and `typst`'s cost, unlike everything else
+involved, grows with the size of the document rather than with the number of
+measurements in it. Both are made once, at the end. Everything else is exactly
+what the final report will contain, which is also why a run that never reaches
+the end, on a pod that was evicted or a machine that was taken away, now leaves
+a complete report of everything up to that point rather than a directory of
+logs.
+
+A rebuild is cheap: on a finished three-pass, two-mount, eight-test run it is
+2.5s to redraw every chart and 0.3s for the Markdown, the HTML and the PDF
+together — almost all of it awk over the fio logs. Against a 60-second fio job
+that is a few percent, which is why `test` is the default rather than something
+to opt into.
 
 Graphs are drawn by awk (`graphs/render-chart.awk`) rather than gnuplot — every
 chart is real SVG with a hover tooltip baked in, so the same file that renders

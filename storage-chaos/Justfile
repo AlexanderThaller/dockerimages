@@ -17,7 +17,7 @@
 # container, so `MODE=deterministic INTERVAL=120 just chaos portworx` works.
 
 image := "storage-chaos"
-tag := "2026-09-04-r1"
+tag := "2026-09-10-r0"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -148,7 +148,7 @@ _run-against imageref +namespaces:
     # `LABEL=osd-kills just chaos openshift-storage`.
     for v in SELECTOR INCLUDE EXCLUDE MODE SEED ITERATIONS DURATION INTERVAL \
              START_DELAY BATCH KILL_MODE GRACE WAIT_READY READY_TIMEOUT POLL \
-             MIN_READY DRY_RUN REPORT LABEL RUNDIR; do
+             MIN_READY DRY_RUN REPORT PROGRESSIVE LABEL RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script needs no privilege and so

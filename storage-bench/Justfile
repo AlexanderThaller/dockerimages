@@ -14,7 +14,7 @@
 # container, so `FIO_RUNTIME=60 ORDER=by-test just bench /tank/backup` works.
 
 image := "storage-bench"
-tag := "2026-09-09-r0"
+tag := "2026-09-10-r0"
 
 # Where `just push` sends the image when no registry is given on the command
 # line. `just push quay.io/someone` still overrides it for a one-off.
@@ -154,7 +154,7 @@ _run-against imageref +hostpaths:
     # `LABEL=before-upgrade just run /mnt/ceph`.
     for v in ORDER REPEATS SETTLE TEST_SETTLE FIO_TESTS FIO_SIZE FIO_RUNTIME IOENGINE LOG_AVG_MSEC \
              PGBENCH PGBENCH_SCALE PGBENCH_CLIENTS PGBENCH_JOBS PGBENCH_TIME \
-             PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL ARCHIVE LABEL RUNDIR; do
+             PGBENCH_WARMUP PGBENCH_MODE PGBENCH_MAX_WAL ARCHIVE PROGRESSIVE LABEL RUNDIR; do
         if [ -n "${!v:-}" ]; then envs+=(-e "$v=${!v}"); fi
     done
     # As the calling user, both because the script is meant to run unprivileged

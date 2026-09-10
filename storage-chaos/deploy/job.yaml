@@ -12,6 +12,11 @@
 #   oc -n storage-chaos cp $(oc -n storage-chaos get pod -l job-name=storage-chaos \
 #       -o name | head -1 | cut -d/ -f2):/out ./chaos-results
 #
+# That copy also works while the run is going: the report is rebuilt after
+# every round and renamed into place, so a `cp` at any point gets a complete
+# report of the rounds so far rather than a half-written one. Only the PDF
+# waits for the end.
+#
 # A PVC instead of the emptyDir would outlive the pod and remove the need for
 # the hold — but it would also mean this run's report lands on the storage the
 # run is disrupting, which is a way to lose exactly the report that mattered.

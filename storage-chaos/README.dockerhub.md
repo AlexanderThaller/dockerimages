@@ -78,6 +78,7 @@ name can express.
 | `LABEL` | none | Appended to the default `RUNDIR` (`LABEL=osd-kills` → `chaos-<ts>-osd-kills`). Ignored if `RUNDIR` is set explicitly. |
 | `RUNDIR` | `chaos-<ts>` | This run's directory inside it |
 | `REPORT` | `html` | `html`, `md` or `none` |
+| `PROGRESSIVE` | `round` | Rebuild the report after every round, or `none` for only at the end |
 | `HOLD` | `0` | Seconds to stay alive after the report is written |
 | `KUBECTL` | `kubectl` | Client to use; may carry flags |
 

@@ -205,8 +205,22 @@ the replacement start before the old container is necessarily gone.
 | `LABEL` | none | Appended to the default `RUNDIR`, so a run stays sortable by timestamp and still readable (`LABEL=osd-kills` → `chaos-<timestamp>-osd-kills`). Only shapes the default — ignored once `RUNDIR` is set explicitly. |
 | `RUNDIR` | `chaos-<timestamp>` | This run's directory inside it; empty writes straight into `OUTBASE` |
 | `REPORT` | `html` | `html` (HTML *and* PDF), `md` or `none` |
+| `PROGRESSIVE` | `round` | Rebuild the report after every round (`round`) or only at the end (`none`) |
 | `HOLD` | `0` | Seconds to stay alive after the report is written |
 | `KUBECTL` | `kubectl` | Client to use; may carry flags, e.g. `oc --context lab` |
+
+A run of a hundred kills paced a minute apart is most of two hours, and a
+timeline that appears when the last pod comes back is one nobody can hold
+against a benchmark that is still running. So the charts and the report are
+rebuilt after every round, over the events recorded so far, and rewritten in
+place: open `report.html` after the first kill and reload it as the run goes. A
+report of a run still in progress says so in a banner at the top of it. The PDF
+is left to the end — it is the copy that gets sent on afterwards rather than the
+one anyone watches a run through, and `typst`'s cost is the only one here that
+grows with the document rather than with the number of kills in it. Everything
+else is rebuilt every round, which is also why a run that never reaches its own
+end, on a Job that was evicted or a cluster that was taken away, still leaves a
+rendered report of everything up to that point.
 
 `HOLD` is for the in-cluster case and nothing else. `kubectl cp` copies out of a
 *running* container, and a Job whose command has returned has none — so without

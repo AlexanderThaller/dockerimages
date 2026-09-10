@@ -133,6 +133,12 @@ working set would report the speed of RAM. `fsync`, `synchronous_commit` and
 | --- | --- | --- |
 | `PLOT` | `1` | `0` skips the graphs. |
 | `RENDER` | `html` | Renders both HTML and PDF; `none` writes only the Markdown. |
+| `PROGRESSIVE` | `test` | Rebuild the report as the run goes — after every test, every `pass`, or `none`. |
+
+The report is rewritten after every test, over whatever has finished by then,
+so `storage-benchmark-report.html` is readable ten minutes into a run that
+takes hours and says in a banner how far along it is. The PDF and the archive
+are made once, at the end.
 
 ## What you get
 
